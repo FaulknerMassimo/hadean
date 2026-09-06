@@ -1,0 +1,10 @@
+[package]
+name = "hadean-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "L0 substrate: units, deterministic RNG, grid, time, state hashing"
+
+[dependencies]
+serde = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "hadean-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless runner: long simulations without a viewer"
+
+[[bin]]
+name = "hadean"
+path = "src/main.rs"
+
+[dependencies]
+hadean-core = { workspace = true }
+hadean-chem = { workspace = true }
+hadean-fields = { workspace = true }
+hadean-sim = { workspace = true }
+hadean-analysis = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

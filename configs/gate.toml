@@ -1,0 +1,118 @@
+# The Phase 2 population gate, at a size you will actually run.
+#
+# Physically this is `pond.toml`: same chemistry, same sun, same vents, same
+# cell design. The only differences are the grid -- an eighth of the volume, so
+# a four-cycle run takes twenty minutes instead of an afternoon -- and the cell
+# lifecycle numbers, which are the ones the gate is tuned on. `pond.toml` keeps
+# the defaults the code ships with.
+#
+#     hadean ecology --config configs/gate.toml --ticks 250000
+#
+# Three numbers here are the tuning, and each was arrived at by watching a
+# population die of the alternative:
+#
+#   division_reserve = 1e-8    A population's response time is roughly
+#                              division_reserve / surplus power, and it has to
+#                              be long next to the resource it eats. At 2e-10
+#                              the cells double every fifteen seconds, strip a
+#                              day's food by mid-afternoon, and meet the night
+#                              with nothing. At 3e-9 they still overshoot and
+#                              die on the fourth night. This puts the two
+#                              timescales within a factor of two.
+#
+#   starvation_time = 300      The night is three hundred seconds long and
+#                              photochemistry stops dead in the dark. A cohort
+#                              that cannot outlast the dark does not have a bad
+#                              night, it goes extinct by morning.
+#
+#   maximum_age = 1200         Two day cycles. Long enough that ageing is not
+#                              what regulates the population -- food is.
+#
+#   membrane_scale = 1000      The one that mattered most, and the last to be
+#                              found. A cell stops eating at the concentration
+#                              where uptake pays its maintenance, so this sets
+#                              how much food is still in the water at dusk --
+#                              and across a night, when photochemistry makes
+#                              nothing, the population has to live on exactly
+#                              that. At 6000 the cells are efficient enough to
+#                              strip the pond bare and starve in the dark; the
+#                              night bill works out at about a night's worth of
+#                              production, which puts this near a thousand.
+#
+# The sun deliberately still rises and sets. A fixed sun looks like better
+# experiment control and is not: it drains the photoreaction's precursor and
+# the food supply decays to nothing. The night is what puts it back.
+
+name = "gate"
+seed = 1
+dt = 0.01
+
+[grid]
+nx = 24
+ny = 24
+nz = 10
+dx = 2.5e-5
+
+[schedule]
+physics = 1
+chemistry = 1
+transport = 1
+neural = 1
+expression = 10
+growth = 20
+development = 50
+phylogeny = 500
+audit = 100
+
+[chemistry]
+n_compounds = 32
+n_reactions = 240
+max_skeleton = 4
+ea_min_zj = 6.0
+ea_max_zj = 160.0
+rate_min = 0.1
+rate_max = 10000.0
+addition_fraction = 0.3
+absorption_scale = 4000.0
+photo_yield = 0.35
+n_photo = 2
+
+[light]
+irradiance = [40.0, 70.0, 95.0, 110.0, 105.0, 85.0, 55.0, 30.0]
+medium_extinction = [220.0, 260.0, 300.0, 350.0, 420.0, 520.0, 650.0, 820.0]
+day_length = 600.0
+
+[heat]
+ambient = 293.15
+sky = 289.15
+surface_transfer = 60.0
+vent_power = 2.0e-9
+vents = 3
+
+[flow]
+speed = 2.0e-5
+rolls = 2
+
+[vents]
+fuel_rate = 4.0e9
+fuel_species = 2
+
+[initial]
+water = 2.0e11
+primordial = 2.0e9
+noise = 0.25
+
+[cells]
+enabled = true
+initial_count = 16
+population_cap = 60000
+birth_radius = 4.0e-6
+membrane_scale = 1000.0
+metabolic_rate = 20.0
+capture_efficiency = 0.6
+maintenance_power = 1.0e-11
+division_reserve = 1.0e-8
+starvation_time = 300.0
+maximum_age = 1200.0
+decomposition_rate = 0.8
+seed_delay = 150.0

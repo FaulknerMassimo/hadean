@@ -1,0 +1,13 @@
+[package]
+name = "hadean-fields"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "L2 fields: diffusion, advection, heat, light, flow, wave channels"
+
+[dependencies]
+hadean-core = { workspace = true }
+hadean-chem = { workspace = true }
+serde = { workspace = true }
+rayon = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "hadean-cell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "L4 protocells: membrane transport, metabolism, division, and decomposition"
+
+[dependencies]
+hadean-core = { workspace = true }
+hadean-chem = { workspace = true }
+hadean-fields = { workspace = true }
+serde = { workspace = true }

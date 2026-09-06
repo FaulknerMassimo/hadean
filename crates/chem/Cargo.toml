@@ -1,0 +1,11 @@
+[package]
+name = "hadean-chem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "L1 chemistry: elements, molecules, procedural reaction networks, kinetics"
+
+[dependencies]
+hadean-core = { workspace = true }
+serde = { workspace = true }

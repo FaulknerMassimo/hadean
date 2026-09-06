@@ -1,0 +1,73 @@
+name = "pond"
+seed = 1
+dt = 0.01
+
+[grid]
+nx = 48
+ny = 48
+nz = 20
+dx = 2.5e-5
+
+[schedule]
+physics = 1
+chemistry = 1
+transport = 1
+neural = 1
+expression = 10
+growth = 20
+development = 50
+phylogeny = 500
+audit = 100
+
+[chemistry]
+n_compounds = 32
+n_reactions = 240
+max_skeleton = 4
+ea_min_zj = 6.0
+ea_max_zj = 160.0
+rate_min = 0.1
+rate_max = 10000.0
+addition_fraction = 0.3
+absorption_scale = 4000.0
+photo_yield = 0.35
+n_photo = 2
+
+[light]
+irradiance = [40.0, 70.0, 95.0, 110.0, 105.0, 85.0, 55.0, 30.0]
+medium_extinction = [220.0, 260.0, 300.0, 350.0, 420.0, 520.0, 650.0, 820.0]
+day_length = 600.0
+
+[heat]
+ambient = 293.15
+sky = 289.15
+surface_transfer = 60.0
+vent_power = 2.0e-9
+vents = 3
+
+[flow]
+speed = 2.0e-5
+rolls = 2
+
+[vents]
+fuel_rate = 4.0e9
+fuel_species = 2
+
+[initial]
+water = 2.0e11
+primordial = 2.0e9
+noise = 0.25
+
+[cells]
+enabled = true
+initial_count = 24
+population_cap = 60000
+birth_radius = 4.0e-6
+membrane_scale = 2000.0
+metabolic_rate = 20.0
+capture_efficiency = 0.6
+maintenance_power = 4.0e-12
+division_reserve = 2.0e-10
+starvation_time = 120.0
+maximum_age = 600.0
+decomposition_rate = 0.8
+seed_delay = 150.0

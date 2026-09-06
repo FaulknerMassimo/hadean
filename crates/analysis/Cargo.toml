@@ -1,0 +1,17 @@
+[package]
+name = "hadean-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Time series, drift trend analysis, and reporting"
+
+[dependencies]
+hadean-core = { workspace = true }
+hadean-chem = { workspace = true }
+hadean-sim = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The population gate is a claim about cells, so its tests configure them.
+hadean-cell = { workspace = true }

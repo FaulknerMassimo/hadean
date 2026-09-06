@@ -1,0 +1,21 @@
+[package]
+name = "hadean-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Simulation orchestration: world state, scheduling, audit, snapshots"
+
+[dependencies]
+hadean-core = { workspace = true }
+hadean-chem = { workspace = true }
+hadean-fields = { workspace = true }
+hadean-cell = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+zstd = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+rayon = { workspace = true }
