@@ -84,6 +84,16 @@ pub struct PopulationCurve {
     /// Food at the trough over food at the peak. Above one means the crash
     /// let the larder refill -- which is what the recovery then spends.
     pub substrate_rebound: f64,
+    /// Cells born after the peak.
+    ///
+    /// The recovery leg cannot happen without this, and for a long time it was
+    /// exactly zero: every run of the gate ended with `births` equal to the
+    /// peak population, because a population of clones all reach break-even
+    /// together and none of them ever has the surplus to divide again. That is
+    /// a freeze rather than a carrying capacity, and it looks identical to one
+    /// in the population column -- so the number gets reported whether the run
+    /// passes or not.
+    pub births_after_peak: u64,
     pub samples: usize,
     pub thresholds: Thresholds,
 }
@@ -147,8 +157,8 @@ impl PopulationCurve {
         }
         if !self.recovered() {
             return format!(
-                "no recovery - still at {} since the crash to {}",
-                self.recovery.population, self.trough.population
+                "no recovery - still at {} since the crash to {}, on {} births since the peak",
+                self.recovery.population, self.trough.population, self.births_after_peak
             );
         }
         format!(
@@ -181,6 +191,7 @@ pub fn population_curve(series: &Series, cap: u64, thresholds: Thresholds) -> Po
         cap_limited: false,
         substrate_drawdown: 1.0,
         substrate_rebound: 1.0,
+        births_after_peak: 0,
         samples: rows.len(),
         thresholds,
     };
@@ -229,6 +240,9 @@ pub fn population_curve(series: &Series, cap: u64, thresholds: Thresholds) -> Po
             cap_limited: cap > 0 && rows.iter().any(|r| r.population >= cap),
             substrate_drawdown: ratio(rows[founding].substrate, rows[peak].substrate),
             substrate_rebound: ratio(rows[trough].substrate, rows[peak].substrate),
+            births_after_peak: rows[rows.len() - 1]
+                .births
+                .saturating_sub(rows[peak].births),
             samples: rows.len(),
             ..empty
         }

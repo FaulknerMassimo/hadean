@@ -60,6 +60,75 @@ pub struct CellConfig {
     /// The draw is a pure function of the cell's id, so a cell's allotted span
     /// is fixed at birth, survives a snapshot, and costs no state.
     pub lifespan_spread: f32,
+    /// Fractional spread of the heritable traits -- see [`Traits`].
+    ///
+    /// One number doing two jobs, because they are the same job: it is the
+    /// standing variation the founding cohort arrives with, and the size of
+    /// the mutational kick a daughter gets at every division. Zero makes every
+    /// cell an exact clone of the ancestor for ever, which is what the cell
+    /// layer did before traits existed and is the control this is measured
+    /// against.
+    ///
+    /// **How big it has to be is not a matter of taste.** A population eats
+    /// down until its marginal cell breaks even, so with
+    /// `income(u) = k u C e` and `bill(u) = m (1 - c + c u)`, that cell fixes
+    /// the water at `k C e = m (1 - c + c u_m) / u_m`. A cell a fraction `d`
+    /// better off than it then earns
+    ///
+    /// ```text
+    ///     surplus = m (1 - c + c u_m)(1 + d) - m (1 - c) - m c u_m (1 + d)
+    ///             = m (1 - c) d
+    /// ```
+    ///
+    /// Everything but `d` and the two dials cancels. So the best cell in the
+    /// pond funds a division in
+    /// `division_reserve / (m (1 - c) d)` seconds, and it has to do that
+    /// inside a lifetime:
+    ///
+    /// ```text
+    ///     division_reserve  <  maintenance_power (1 - trait_cost) d maximum_age
+    /// ```
+    ///
+    /// Fail that and the plateau cannot turn over however varied the
+    /// population is, because no cell in it can afford a daughter before it
+    /// dies. Measured at 0.2, the living spread reached `d = 0.32` and the
+    /// right-hand side came to 3.8e-9 J against a `division_reserve` of 1e-8:
+    /// short by a factor of two and a half, and the run duly recorded zero
+    /// births after the peak, exactly as the clone control did.
+    ///
+    /// The inequality is generous, so clearing it is necessary and not
+    /// sufficient. `income = k u C e` holds only while the membrane is the
+    /// bottleneck, and a cell that can take up faster than it can metabolise
+    /// gets less and less out of each extra transporter: at `u = 1.5` the
+    /// measured income is 1.38 times the marginal cell's, not 1.5. So a real
+    /// population needs more spread than the arithmetic asks for.
+    pub trait_spread: f32,
+    /// Fraction of a cell's upkeep that scales with the machinery it carries.
+    ///
+    /// Transporters are not free: a cell with twice the membrane machinery
+    /// pays to keep twice the machinery. The rest of the bill is the fixed
+    /// cost of being a cell at all, and that split is what decides whether
+    /// variation in [`Traits::uptake`] means anything.
+    ///
+    /// A cell breaks even at food concentration
+    ///
+    /// ```text
+    ///     C*(u) = m (1 - c + c u) / (k u e)
+    /// ```
+    ///
+    /// so at `c = 1` -- upkeep entirely proportional to machinery -- the `u`
+    /// cancels and every cell in the population breaks even at exactly the
+    /// same place no matter what it carries. That is the freeze this whole
+    /// mechanism exists to break, reintroduced by the back door. At `c = 0`
+    /// uptake is free, nothing bounds it, and a lineage evolves towards
+    /// stripping the pond to nothing -- the failure `membrane_scale = 6000`
+    /// produced by hand. In between, `C*` falls with `u` towards a floor of
+    /// `c m / (k e)`: evolution makes the population hungrier, and `c` sets
+    /// how much food is still in the water when it has finished.
+    ///
+    /// Neutral at `uptake = 1`, so it does not change what
+    /// `maintenance_power` means for a population of clones.
+    pub trait_cost: f64,
     /// Fraction of working maintenance power a dormant cell pays.
     ///
     /// This is the dial the night bill actually responds to. A population at
@@ -110,6 +179,8 @@ impl Default for CellConfig {
             starvation_time: 120.0,
             maximum_age: 600.0,
             lifespan_spread: 0.4,
+            trait_spread: 0.2,
+            trait_cost: 0.5,
             dormancy_power_fraction: 0.05,
             dormancy_exit: 60.0,
             decomposition_rate: 0.8,
@@ -141,6 +212,12 @@ impl CellConfig {
         if !(0.0..1.0).contains(&self.lifespan_spread) {
             return Err("cell lifespan spread must be in 0..1".into());
         }
+        if self.trait_spread < 0.0 || !self.trait_spread.is_finite() {
+            return Err("cell trait spread must be a finite non-negative fraction".into());
+        }
+        if !(0.0..=1.0).contains(&self.trait_cost) {
+            return Err("cell trait cost must be in 0..1".into());
+        }
         if self.seed_delay < 0.0 || !self.seed_delay.is_finite() {
             return Err("cell seed delay must be a finite number of seconds".into());
         }
@@ -153,6 +230,33 @@ impl CellConfig {
             return Err("cell lifecycle rates and thresholds must be positive".into());
         }
         Ok(())
+    }
+
+    /// The largest `division_reserve` a settled population could still divide
+    /// on, J.
+    ///
+    /// A population eats down until its marginal cell breaks even, and a cell
+    /// a fraction `d` better off than that one is then left with
+    /// `maintenance_power (1 - trait_cost) d` to bank -- see
+    /// [`CellConfig::trait_spread`] for where that comes from. Give it a
+    /// lifetime to do so and that is a budget: a `division_reserve` above it
+    /// cannot be met by anything in the pond, so the plateau has no births in
+    /// it, and without births there is no recovery leg to the Phase 2 gate
+    /// however healthy the curve looks on the way up.
+    ///
+    /// `trait_spread` stands in for `d` here, so this is one standard
+    /// deviation's worth of advantage. The best cell of a few hundred is two
+    /// or three of those out, and against that the real ceiling is a small
+    /// multiple of this -- while the sublinearity noted on `trait_spread`
+    /// pushes the other way. It is an order-of-magnitude check, and it is
+    /// worth making before spending forty minutes on a run: a configuration
+    /// an order below its budget will not turn over, and none of the other
+    /// dials can rescue it.
+    pub fn turnover_budget(&self) -> Joules {
+        self.maintenance_power
+            * (1.0 - self.trait_cost)
+            * self.trait_spread as f64
+            * self.maximum_age as f64
     }
 }
 
@@ -170,6 +274,103 @@ pub enum CellState {
     Dormant,
 }
 
+/// The heritable part of a cell: one number, and the place L3 plugs in.
+///
+/// This is a vestigial genome and it is here because of a measurement rather
+/// than a plan. Before it, every cell in the pond was an exact clone in a
+/// shared voxel, so the whole population broke even at the same food
+/// concentration and arrived there together. What looked like a carrying
+/// capacity was a hundred and thirty-six identical cells freezing at once: ten
+/// runs across every dial the cell layer had, and in every one of them
+/// `births` came out exactly equal to the peak population. Nothing was ever
+/// born after the boom, and a population that does not breed cannot recover,
+/// which is the leg of the Phase 2 gate that was missing.
+///
+/// Variation is what unfreezes it. When cells differ in what they need, a
+/// shortage stops being simultaneous: the pond settles at a concentration
+/// where the poorest cells are already below their line and the best still
+/// have a surplus to divide on, so the plateau turns over -- births and deaths
+/// both non-zero -- instead of standing still.
+///
+/// A fixed struct of scalars cannot grow complexity, which is exactly why
+/// `PLAN.md` specifies a variable-length byte string for the real genome. This
+/// is not that and does not pretend to be. It is the smallest thing that
+/// carries inheritance, mutation and selection through the tick, the audit,
+/// the digest and the snapshot, so that when the genome arrives it replaces a
+/// mechanism that already works rather than introducing one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Traits {
+    /// Multiplier on this cell's membrane permeability.
+    ///
+    /// How much transporter the cell carries. It sets both what the cell can
+    /// take up and, through [`CellConfig::trait_cost`], what it costs to keep,
+    /// so it is a trade-off and not a free dial: a hungrier cell is a more
+    /// expensive cell, and which of those wins depends on how much food is in
+    /// the water.
+    pub uptake: f32,
+}
+
+impl Default for Traits {
+    /// The hand-written ancestor: exactly the config, unmodified.
+    fn default() -> Self {
+        Self { uptake: 1.0 }
+    }
+}
+
+/// How far a lineage's traits may drift from the ancestor's, either way.
+///
+/// Not a tuning dial. A membrane is a physical object and there is a limit to
+/// how much of one a cell this size can carry; without a bound, a long run
+/// walks a lineage off to values where the trade-off this is built on stops
+/// meaning anything.
+const TRAIT_LIMIT: f32 = 8.0;
+
+/// Apply one multiplicative mutational kick.
+///
+/// Log-normal, so the kick is symmetric in the thing that matters -- halving
+/// and doubling are the same size of step -- and a trait can never be pushed
+/// through zero into a negative membrane.
+fn mutate(value: f32, spread: f32, kick: f32) -> f32 {
+    if spread <= 0.0 {
+        return value;
+    }
+    (value * (spread * kick).exp()).clamp(1.0 / TRAIT_LIMIT, TRAIT_LIMIT)
+}
+
+impl Traits {
+    /// The ancestor's traits, as the founding cohort draws them.
+    ///
+    /// A pure function of the cell's id, like [`lifespan`], so a founder's
+    /// starting point does not depend on when or in what order it was made.
+    fn founder(cfg: &CellConfig, rng: &Counter, id: u64) -> Self {
+        Self {
+            uptake: mutate(
+                1.0,
+                cfg.trait_spread,
+                rng.normal(0, id, Purpose::Mutation, 0),
+            ),
+        }
+    }
+
+    /// What a daughter inherits from this cell.
+    fn inherit(self, cfg: &CellConfig, rng: &Counter, tick: u64, parent: u64) -> Self {
+        Self {
+            uptake: mutate(
+                self.uptake,
+                cfg.trait_spread,
+                rng.normal(tick, parent, Purpose::Mutation, 0),
+            ),
+        }
+    }
+}
+
+impl HashState for Traits {
+    fn hash_state(&self, h: &mut StateHasher) {
+        h.f32(self.uptake);
+    }
+}
+
 /// A single protocell. Contents use `f64` because crossing a membrane between
 /// the pond's large `f32` amounts and a tiny compartment must not lose mass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +386,8 @@ pub struct Cell {
     pub age: f32,
     pub state: CellState,
     pub generation: u32,
+    /// What this cell inherited. See [`Traits`].
+    pub traits: Traits,
 }
 
 impl Cell {
@@ -200,6 +403,19 @@ impl Cell {
 
     pub fn voxel(&self, grid: &Grid) -> usize {
         grid.voxel_at(self.pos)
+    }
+
+    /// The membrane permeability multiplier this cell actually runs.
+    pub fn membrane_scale(&self, cfg: &CellConfig) -> f64 {
+        cfg.membrane_scale as f64 * self.traits.uptake as f64
+    }
+
+    /// What staying alive costs this cell, W.
+    ///
+    /// Part fixed cost of being a cell, part the machinery it carries; see
+    /// [`CellConfig::trait_cost`] for why the split is the whole point.
+    pub fn maintenance(&self, cfg: &CellConfig) -> f64 {
+        cfg.maintenance_power * (1.0 - cfg.trait_cost + cfg.trait_cost * self.traits.uptake as f64)
     }
 
     pub fn chemical_energy(&self, chem: &Chemistry) -> Joules {
@@ -228,6 +444,7 @@ impl HashState for Cell {
         h.f32(self.age);
         h.byte(self.state as u8);
         h.u32(self.generation);
+        self.traits.hash_state(h);
     }
 }
 
@@ -300,6 +517,7 @@ impl Population {
                 age: 0.0,
                 state: CellState::Alive,
                 generation: 0,
+                traits: Traits::founder(cfg, rng, id),
             });
         }
         self.next_id = self.cells.len() as u64;
@@ -333,6 +551,32 @@ impl Population {
     /// that is working draw the same line on a population chart.
     pub fn dormant(&self) -> usize {
         self.cells.iter().filter(|c| c.is_dormant()).count()
+    }
+
+    /// Where the living population's heritable traits currently sit.
+    ///
+    /// Two numbers, and both are needed. The mean says which way selection is
+    /// pushing; the spread says whether there is anything left for it to push
+    /// on. A spread that collapses to nothing is the freeze coming back --
+    /// the population has become clones again, by a different route.
+    pub fn trait_summary(&self) -> TraitSummary {
+        let mut n = 0.0;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for cell in self.cells.iter().filter(|c| c.is_alive()) {
+            let u = cell.traits.uptake as f64;
+            n += 1.0;
+            sum += u;
+            sum_sq += u * u;
+        }
+        if n == 0.0 {
+            return TraitSummary::default();
+        }
+        let mean = sum / n;
+        TraitSummary {
+            mean_uptake: mean,
+            uptake_spread: (sum_sq / n - mean * mean).max(0.0).sqrt(),
+        }
     }
 
     pub fn stored_energy(&self, chem: &Chemistry) -> Joules {
@@ -458,6 +702,14 @@ impl HashState for Population {
             cell.hash_state(h);
         }
     }
+}
+
+/// Where a population's heritable traits sit, for the run log.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TraitSummary {
+    pub mean_uptake: f64,
+    /// Standard deviation of `uptake` across the living population.
+    pub uptake_spread: f64,
 }
 
 /// Mean particles per voxel a compound needs before it counts as food at all.
@@ -590,7 +842,7 @@ fn exchange(
     let area = (4.0 * PI * cell.radius * cell.radius) as f64;
     let cell_v = cell_volume(cell.radius);
     let voxel_v = grid.voxel_volume() as f64;
-    let scale = cfg.membrane_scale as f64 * area * dt;
+    let scale = cell.membrane_scale(cfg) * area * dt;
     for c in 0..table.len() {
         let outside = amounts.get(c, voxel) as f64;
         let inside = cell.contents[c];
@@ -666,7 +918,7 @@ fn metabolize(
 /// has never had, and the reason it can outlast a night that would kill it
 /// working.
 fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField, dt: f64) {
-    let working = cfg.maintenance_power * dt;
+    let working = cell.maintenance(cfg) * dt;
     if cell.state == CellState::Alive && cell.reserve < working {
         cell.state = CellState::Dormant;
     }
@@ -692,7 +944,7 @@ fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField
     // something close to the working bill on average, which is no dormancy at
     // all.
     if cell.state == CellState::Dormant
-        && cell.reserve >= cfg.maintenance_power * cfg.dormancy_exit as f64
+        && cell.reserve >= cell.maintenance(cfg) * cfg.dormancy_exit as f64
     {
         cell.state = CellState::Alive;
     }
@@ -763,6 +1015,7 @@ fn divide(
         age: 0.0,
         state: CellState::Alive,
         generation: parent.generation + 1,
+        traits: parent.traits.inherit(cfg, rng, tick, parent.id),
     }
 }
 
@@ -1281,6 +1534,7 @@ mod tests {
             age: 0.0,
             state: CellState::Alive,
             generation: 0,
+            traits: Traits::default(),
         };
         let dt = 0.01;
         let opening = cell.reserve;
@@ -1370,6 +1624,7 @@ mod tests {
             age: 0.0,
             state: CellState::Alive,
             generation: 0,
+            traits: Traits::default(),
         };
 
         let mut shut_down_at = None;
@@ -1472,6 +1727,323 @@ mod tests {
         // And zero spread is still the old fixed-age world, exactly.
         cfg.lifespan_spread = 0.0;
         assert_eq!(lifespan(&cfg, &rng, 42), cfg.maximum_age);
+    }
+
+    #[test]
+    fn a_daughter_inherits_its_parent_with_a_kick() {
+        // Inheritance with variation, which is the whole of the mechanism.
+        // Identical daughters give back the frozen plateau; daughters
+        // unrelated to their parents give a random walk with nothing for
+        // selection to accumulate.
+        let (mut cfg, grid, chem, rng, amounts, ..) = setup();
+        cfg.trait_spread = 0.2;
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        let parent = &mut p.cells[0];
+        parent.traits.uptake = 2.0;
+        parent.reserve = cfg.division_reserve;
+
+        let children: Vec<f32> = (0..64)
+            .map(|tick| divide(parent, &cfg, &grid, &rng, tick, 1_000 + tick).traits.uptake)
+            .collect();
+
+        let mean = children.iter().sum::<f32>() / children.len() as f32;
+        assert!(
+            (mean - 2.0).abs() < 0.4,
+            "daughters averaged {mean}, which is not their parent's 2.0"
+        );
+        assert!(
+            children.iter().any(|&u| u != 2.0),
+            "every daughter was an exact copy"
+        );
+        assert!(
+            children.iter().all(|&u| u > 0.0),
+            "a mutation pushed a trait through zero"
+        );
+
+        // And no spread is the old world exactly: clones, for ever.
+        cfg.trait_spread = 0.0;
+        assert_eq!(
+            divide(parent, &cfg, &grid, &rng, 7, 2_000).traits.uptake,
+            parent.traits.uptake
+        );
+    }
+
+    #[test]
+    fn founders_vary_and_their_traits_are_settled_at_birth() {
+        let mut cfg = CellConfig {
+            trait_spread: 0.2,
+            ..Default::default()
+        };
+        let rng = Counter::new(11);
+
+        let drawn: Vec<f32> = (0..400).map(|id| Traits::founder(&cfg, &rng, id).uptake).collect();
+        let lowest = drawn.iter().cloned().fold(f32::INFINITY, f32::min);
+        let highest = drawn.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            highest / lowest > 2.0,
+            "founders span only {lowest}..{highest}, which is one cell repeated"
+        );
+        assert_eq!(drawn[42], Traits::founder(&cfg, &rng, 42).uptake);
+
+        cfg.trait_spread = 0.0;
+        assert_eq!(Traits::founder(&cfg, &rng, 42), Traits::default());
+    }
+
+    #[test]
+    fn a_lineage_cannot_drift_off_to_infinity() {
+        // Log-normal kicks compound, so a long lineage under steady selection
+        // would otherwise walk to values where a membrane stops meaning
+        // anything physical.
+        let (mut cfg, grid, chem, rng, amounts, ..) = setup();
+        cfg.trait_spread = 0.5;
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        let cell = &mut p.cells[0];
+        for tick in 0..500 {
+            // Keep the luckiest of each pair, which is selection at its most
+            // ruthless: straight up the gradient every generation.
+            let child = divide(cell, &cfg, &grid, &rng, tick, 3_000 + tick);
+            if child.traits.uptake > cell.traits.uptake {
+                cell.traits = child.traits;
+            }
+        }
+        assert_eq!(cell.traits.uptake, TRAIT_LIMIT);
+    }
+
+    #[test]
+    fn a_hungrier_cell_earns_more_and_costs_more() {
+        // The trade-off, isolated. Uptake that came free would ratchet up
+        // until the population stripped the pond bare -- which is the failure
+        // `membrane_scale = 6000` produced by hand -- so the machinery has to
+        // be worth keeping rather than merely worth having.
+        let (mut cfg, grid, chem, rng, mut amounts, mut residual, ..) = setup();
+        cfg.trait_cost = 0.5;
+        // Well below the membrane's own ceiling. `exchange` will never hand
+        // over more than a fifth of a voxel in a step, and at the configured
+        // scale a full pond puts both of these cells hard against that clamp,
+        // where the trait cannot show because nothing is limited by it.
+        cfg.membrane_scale = 1.0;
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        let table = CompoundTable::new(&chem);
+
+        // Uptake is a permeability, so it is the *flux* it multiplies, not the
+        // concentration the cell eventually reaches. Left alone long enough
+        // both of these equilibrate with the same water and hold the same
+        // amount; the difference that matters to a cell is how fast it gets
+        // there, because metabolism is spending the inside the whole time.
+        p.cells[0].traits.uptake = 0.5;
+        p.cells[1].traits.uptake = 2.0;
+        for cell in p.cells.iter_mut() {
+            exchange(cell, &cfg, &grid, &table, &mut amounts, &mut residual, 0.01);
+        }
+
+        let taken: Vec<f64> = p.cells.iter().map(|c| c.contents.iter().sum()).collect();
+        assert!(
+            taken[1] > 3.0 * taken[0],
+            "the hungrier cell took {:e} against {:e}",
+            taken[1],
+            taken[0]
+        );
+        assert!(
+            p.cells[1].maintenance(&cfg) > p.cells[0].maintenance(&cfg),
+            "and paid no more for it"
+        );
+
+        // Neutral at the ancestor's value, so `trait_cost` does not quietly
+        // redefine `maintenance_power` for a population of clones.
+        let mut clone = p.cells[0].clone();
+        clone.traits = Traits::default();
+        assert_eq!(clone.maintenance(&cfg), cfg.maintenance_power);
+    }
+
+    /// Two cells of the given uptakes, each in its own voxel, in water held at
+    /// a fixed concentration for `seconds`. Returns each cell and how many
+    /// ticks it spent shut down.
+    ///
+    /// A chemostat rather than a world. Every claim below is about what one
+    /// water level does to two different cells, and in a closed voxel each of
+    /// them would quietly eat its way down to a different one.
+    fn chemostat(
+        uptakes: [f32; 2],
+        trait_cost: f64,
+        bill: f64,
+        opening: f64,
+        seconds: f64,
+    ) -> Vec<(Cell, u64)> {
+        let (mut cfg, grid, chem, rng, mut amounts, mut residual, mut heat, flow) = setup();
+        cfg.initial_count = 2;
+        cfg.trait_cost = trait_cost;
+        cfg.maintenance_power = bill;
+        // Never divide, never age out: this is about one cell's books.
+        cfg.division_reserve = 1.0e30;
+        cfg.maximum_age = 1.0e9;
+
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        for (cell, uptake) in p.cells.iter_mut().zip(uptakes) {
+            cell.traits.uptake = uptake;
+            cell.reserve = opening;
+        }
+        p.cells[0].pos = [1.5 * grid.dx, 1.5 * grid.dx, 1.5 * grid.dx];
+        p.cells[1].pos = [5.5 * grid.dx, 5.5 * grid.dx, 1.5 * grid.dx];
+
+        let mut dormant = vec![0u64; 2];
+        for tick in 0..(seconds / 0.01) as u64 {
+            for c in 0..chem.n_compounds() {
+                amounts.plane_mut(c).fill(2.0e7);
+            }
+            p.step(
+                &cfg,
+                &grid,
+                &chem,
+                &flow,
+                &rng,
+                tick,
+                0.01,
+                20,
+                &mut amounts,
+                &mut residual,
+                &mut heat,
+            );
+            for (i, cell) in p.cells.iter().enumerate() {
+                dormant[i] += cell.is_dormant() as u64;
+            }
+        }
+        p.cells.iter().cloned().zip(dormant).collect()
+    }
+
+    #[test]
+    fn variation_gives_the_best_cells_a_surplus_where_the_worst_are_starving() {
+        // The reason traits exist. A population of clones breaks even at one
+        // food concentration, so when the pond falls below it every cell falls
+        // below it at once: the plateau freezes with no surplus anywhere to
+        // divide on, and ten runs of the gate reported `births` exactly equal
+        // to the peak population. With variation the same water is a living
+        // for some cells and not for others, which is what a carrying capacity
+        // is supposed to feel like from the inside.
+        const UPTAKES: [f32; 2] = [0.6, 2.5];
+        const COST: f64 = 0.5;
+        let seconds = 300.0;
+
+        // What each of them can earn out of this water with no bill to pay.
+        // Measured rather than derived: the point is that there is a band of
+        // upkeeps between the two, and the band has to be found before it can
+        // be aimed at.
+        let free = chemostat(UPTAKES, COST, 0.0, 0.0, seconds);
+        let income: Vec<f64> = free.iter().map(|(c, _)| c.reserve / seconds).collect();
+        assert!(
+            income[1] > 2.0 * income[0],
+            "the two cells earn {:e} and {:e} W, which is not a band to aim at",
+            income[0],
+            income[1]
+        );
+
+        // A bill inside that band: a living for one of them and not the other.
+        // They open with ten seconds of it banked, which is enough to start
+        // the run awake and not so much that it ends before the poorer cell
+        // has spent it.
+        let bill = (income[0] * income[1]).sqrt();
+        let opening = bill * 10.0;
+        let out = chemostat(UPTAKES, COST, bill, opening, seconds);
+        let (poor, poor_dormant) = &out[0];
+        let (rich, rich_dormant) = &out[1];
+
+        assert!(
+            rich.reserve > opening,
+            "the better-equipped cell went backwards: {:e} J from {:e} J",
+            rich.reserve,
+            opening
+        );
+        assert!(
+            poor.reserve < opening,
+            "the poorer cell paid its way after all: {:e} J from {:e} J",
+            poor.reserve,
+            opening
+        );
+        assert_eq!(*rich_dormant, 0, "the cell with a surplus shut down anyway");
+        assert!(*poor_dormant > 0, "the cell below its line never shut down");
+    }
+
+    #[test]
+    fn a_better_cells_surplus_is_the_bill_times_what_is_fixed_about_it() {
+        // The arithmetic the whole mechanism turns on, checked against the
+        // cell layer rather than against itself.
+        //
+        // A population eats down until its marginal cell breaks even, which
+        // fixes the water at `k C e = m (1 - c + c u_m) / u_m`. A cell a
+        // fraction `d` better off than that one then earns
+        //
+        //     surplus = m (1 - c + c u_m)(1 + d) - m (1 - c) - m c u_m (1 + d)
+        //             = m (1 - c) d
+        //
+        // and everything but `d` and the two dials cancels. It matters because
+        // it says what a plateau needs in order to turn over: the best cell
+        // has to fund a whole `division_reserve` out of `m (1 - c) d`, inside
+        // one lifetime. At `trait_cost = 1` the surplus is zero for every `d`,
+        // and the population is back to being clones as far as its books are
+        // concerned.
+        //
+        // The closed form is an *upper bound*, and this test is also where
+        // that shows. It assumes income is proportional to uptake, which holds
+        // only while the membrane is the bottleneck; once a cell can take up
+        // faster than it can metabolise, more transporter buys less and less.
+        // A better cell's real advantage is therefore smaller than `d`, so a
+        // plateau needs more variation to turn over than the formula asks for,
+        // not less.
+        const COST: f64 = 0.5;
+        const ADVANTAGE: f64 = 0.5;
+        let uptakes = [1.0, 1.0 + ADVANTAGE as f32];
+        let seconds = 300.0;
+
+        // Put the marginal cell exactly at break-even by measuring what it
+        // earns and handing it a bill of the same size. At `u_m = 1` the bill
+        // is `m` whatever the cost split is, so `m` is that income.
+        let free = chemostat(uptakes, COST, 0.0, 0.0, seconds);
+        let income: Vec<f64> = free.iter().map(|(c, _)| c.reserve / seconds).collect();
+        let m = income[0];
+
+        let opening = m * 100.0;
+        let out = chemostat(uptakes, COST, m, opening, seconds);
+        let measured = (out[1].0.reserve - opening) / seconds;
+
+        // What the cell layer's own books say it should have banked: what it
+        // earned, less what a cell carrying that much machinery is charged.
+        let booked = income[1] - m * (1.0 - COST + COST * uptakes[1] as f64);
+        assert!(
+            (measured - booked).abs() < 0.1 * booked.abs(),
+            "banked {measured:e} W against {booked:e} W of income less upkeep"
+        );
+
+        // And the closed form above it, which the sublinearity makes generous.
+        let ceiling = m * (1.0 - COST) * ADVANTAGE;
+        assert!(
+            measured > 0.0 && measured <= ceiling,
+            "surplus {measured:e} W is not inside (0, {ceiling:e}] -- the formula \
+             is supposed to bound it from above"
+        );
+
+        // The marginal cell, by construction, banks nothing.
+        let marginal = (out[0].0.reserve - opening) / seconds;
+        assert!(
+            marginal.abs() < 0.1 * ceiling,
+            "the break-even cell moved by {marginal:e} W"
+        );
+    }
+
+    #[test]
+    fn a_populations_traits_are_reported_from_the_living() {
+        let (mut cfg, grid, chem, rng, amounts, ..) = setup();
+        cfg.trait_spread = 0.0;
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        assert_eq!(p.trait_summary().mean_uptake, 1.0);
+        assert_eq!(p.trait_summary().uptake_spread, 0.0);
+
+        p.cells[0].traits.uptake = 3.0;
+        assert_eq!(p.trait_summary().mean_uptake, 2.0);
+        assert_eq!(p.trait_summary().uptake_spread, 1.0);
+
+        // A corpse has no traits to select on. Counting it would let a die-off
+        // move the mean on its own and read as evolution.
+        p.cells[0].state = CellState::Decomposing;
+        assert_eq!(p.trait_summary().mean_uptake, 1.0);
     }
 
     #[test]

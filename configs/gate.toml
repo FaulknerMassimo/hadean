@@ -72,15 +72,52 @@
 #                              night bill works out at about a night's worth of
 #                              production, which puts this near a thousand.
 #
-# What this config does NOT do is meet the gate, and the reason has narrowed a
-# long way. In every configuration tried -- with and without dormancy, across
-# four thousandfold of `dormancy_power_fraction`, with ageing on, doubled and
-# off, and with `division_reserve` from 1e-8 down to 1e-9 -- the run ends with
-# `births` exactly equal to the peak population. Not one cell divides after the
-# boom. A population that never breeds cannot recover, so the missing leg of the
-# gate is not a survival problem at all; it is that the plateau is a hundred and
-# thirty-six clones arriving at break-even together and freezing there, with no
-# surplus to divide on and nothing to turn over. See HANDOFF.md.
+#   trait_spread = 0.5       Cells differ in how much membrane they carry, and
+#   trait_cost = 0.5         a daughter inherits her mother's with a kick this
+#                            size. Identical clones in a shared voxel all break
+#                            even at the same concentration, so a shortage
+#                            arrives for every cell at once and the plateau
+#                            freezes; variation is what lets a population thin
+#                            from the bottom while its best cells still have
+#                            something to divide on.
+#
+#                            How much variation is needed is arithmetic, not
+#                            taste. The marginal cell fixes the water, and a
+#                            cell a fraction d better off is left with
+#                            maintenance_power (1 - trait_cost) d to bank -- so
+#                            it can only fund a daughter if
+#
+#                              division_reserve
+#                                  < maintenance_power (1-trait_cost) d max_age
+#
+#                            At 0.2 the living spread reached 0.32 and that
+#                            budget came to 3.8e-9 J against a division_reserve
+#                            of 1e-8: short, and the run recorded not one birth
+#                            after its peak, exactly like the clone control.
+#                            0.5 is the largest of the four spreads tried and
+#                            the best of them: the plateau goes from 136 to 156
+#                            on the same food, and the run finishes with five
+#                            cells alive rather than none. `hadean ecology`
+#                            prints this budget before it starts.
+#
+#                            `trait_cost` is what stops uptake being a free
+#                            dial, and it decides which way selection runs. At
+#                            0.5 the survivors of a stripped pond are the cheap
+#                            cells (mean uptake 0.33); at 0.25, where machinery
+#                            costs less, they are the hungry ones (1.63). It is
+#                            neutral at uptake = 1, so a population of clones
+#                            does not notice it at all.
+#
+# What this config does NOT do is meet the gate, and the reason has moved out of
+# the cell layer entirely. The population's food is CH2O2S, which this chemistry
+# makes photochemically out of H2S and CO2 -- and CO2 takes part in exactly one
+# reaction in the whole network, that one. The cells turn CH2O2S into CH2OS and
+# nothing turns it back on any timescale that matters, so every turnover retires
+# a carbon for good. The larder falls from 1.15e13 to 1e9 over four days in
+# every run, clones and variants alike; a pond with one cell that cannot eat
+# holds it flat at 1.15e13 for the same four days. This population is not
+# failing to regulate. It is mining a finite pool, and no dial below reaches
+# that. See HANDOFF.md, "The population is mining, not grazing".
 #
 # The sun deliberately still rises and sets. A fixed sun looks like better
 # experiment control and is not: it drains the photoreaction's precursor and
@@ -158,6 +195,8 @@ division_reserve = 1.0e-8
 starvation_time = 300.0
 maximum_age = 2400.0
 lifespan_spread = 0.4
+trait_spread = 0.5
+trait_cost = 0.5
 dormancy_power_fraction = 0.05
 dormancy_exit = 60.0
 decomposition_rate = 0.8

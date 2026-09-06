@@ -48,18 +48,33 @@ pub struct Row {
     /// Particles of the scarcest compound the population's metabolism eats.
     /// The food supply, recorded next to the mouths that depend on it.
     pub substrate: f64,
+    /// Mean membrane-uptake trait across the living population.
+    ///
+    /// The first evolutionary reading this project takes. One is the ancestor;
+    /// a run that ends anywhere else has selected, and the direction says what
+    /// the pond rewarded.
+    pub mean_uptake: f64,
+    /// Standard deviation of that trait.
+    ///
+    /// Recorded beside the mean because the mean alone cannot tell a
+    /// population that has settled on an answer from one that has run out of
+    /// variation to ask the question with -- and a population of clones is
+    /// exactly the freeze this trait exists to break.
+    pub uptake_spread: f64,
 }
 
 impl Row {
     pub const HEADER: &'static str = "tick,elapsed_s,chemical_j,thermal_j,total_j,expected_j,\
 drift_j,relative_drift,mass_drift,light_in_j,radiated_out_j,vent_heat_in_j,\
 mean_temperature_k,surface_temperature_k,floor_temperature_k,surface_light_w_m2,\
-population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
+population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles,\
+mean_uptake,uptake_spread";
 
     /// Take a reading from a world and its latest audit.
     pub fn sample(world: &World, report: &AuditReport) -> Self {
         let temperature = world.temperature_profile();
         let light = world.light_profile();
+        let traits = world.cells.trait_summary();
         Self {
             tick: report.tick,
             elapsed: world.elapsed(),
@@ -84,12 +99,14 @@ population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_partic
             deaths: world.cells.deaths,
             cellular_reserve: world.cells.total_reserve(),
             substrate: world.limiting_substrate(),
+            mean_uptake: traits.mean_uptake,
+            uptake_spread: traits.uptake_spread,
         }
     }
 
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e}",
+            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6}",
             self.tick,
             self.elapsed,
             self.chemical,
@@ -113,6 +130,8 @@ population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_partic
             self.deaths,
             self.cellular_reserve,
             self.substrate,
+            self.mean_uptake,
+            self.uptake_spread,
         )
     }
 }

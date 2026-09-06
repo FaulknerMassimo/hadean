@@ -17,6 +17,9 @@ cell's lifecycle.
 - L4 protocell (pre-genome): membrane transport, metabolism, maintenance,
   Brownian motion, division, dormancy, individual lifespans, death,
   decomposition
+- Heritable traits: cells differ in how much membrane they carry, daughters
+  inherit their mother's with a mutational kick, and the pond selects — the
+  first evolution in the project
 - Headless CLI, compressed snapshots, replay verification, CSV telemetry
 - Population-curve analysis: boom, bust and recovery read out of a run rather
   than asserted
@@ -24,28 +27,31 @@ cell's lifecycle.
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
 place and the energetics are sized against the pond's measured photochemical
-output. **The gate is not met**, and what stands between it and passing has
-narrowed a good deal.
+output. **The gate is not met**, and the reason has moved twice.
 
-Cells now have dormancy — a cell that cannot pay its upkeep shuts down to a
-fraction of it and waits, rather than accruing damage against a reserve it does
-not have — and their own individual lifespans. Both matter, and neither is
-enough. Dormancy visibly works once it is given room to: a hundred and three of
-a hundred and thirty-six cells sit shut down while the pond is stripped to
-almost nothing, and not one of them dies.
+It was thought to be a famine, and it was ageing: every cell died at exactly
+the same age, so the cohort that boomed together aged out together. Individual
+lifespans fixed that. Then it was that nothing was ever born after the boom —
+a hundred and thirty-six identical clones in a shared pond all break even at
+the same concentration and freeze there, and a population that never breeds
+cannot recover. Cells now carry a heritable trait, so they differ in what they
+need and the pond can select between them. It helps: the plateau rises from 136
+to 156 and the first runs finish with survivors rather than extinct. It is not
+enough on its own, and how much variation would be enough turns out to be an
+inequality you can check before starting a run.
 
-Two things were found by measurement along the way. The population's crash was
-never the famine it looked like — it was ageing, because every cell died at
-exactly the same age and the cohort that boomed together aged out together;
-lifting `maximum_age` makes the crash vanish outright. And underneath that, in
-ten runs across every combination of the dials, the population never divides
-after the initial boom. A population that never breeds cannot recover, so the
-gate's missing leg is not about survival at all. HANDOFF.md has the whole
-diagnosis and the candidates for what comes next.
+Underneath both, the food column says something neither of those explanations
+reached. Over four days the larder falls from 1.15e13 particles to 1e9, in
+every configuration, at almost exactly the same rate whether the pond carries
+136 cells or 156 — while a pond containing one cell that cannot eat holds it
+flat. This population is not failing to regulate. Its food is made from CO2,
+CO2 takes part in exactly one reaction in this chemistry, and the waste it
+excretes has no way back: it is **mining a finite pool**. A boom, a bust and a
+recovery need a renewable resource, and this world does not have one for this
+metabolism. HANDOFF.md has the measurements and what to do about it.
 
 After Phase 2 comes the L3 genome, which replaces the protocell's hardcoded
-traits — and which may need to come first, since the variance between cells
-that a turning-over plateau seems to want is exactly what a genome provides.
+traits with a real one.
 
 ## Run it
 
@@ -93,6 +99,12 @@ ancestor eats builds to a peak and then decays to nothing, because the
 photoreaction drains its own precursor and nothing regenerates it. The night is
 what lets the chemistry recover. In this world the day/night cycle is not a
 confound in the experiment, it is the experiment's renewable resource.
+
+That still holds, and it is not the whole story. The lifeless pond under a
+moving sun holds its food at 1.15e13 particles indefinitely, so the sun really
+does keep the chemistry turning over. What it cannot do is put back an atom the
+population has retired: the day/night cycle renews the *state* of the
+chemistry, not its *stock*. Both have to be renewable, and only one of them is.
 
 See [PLAN.md](PLAN.md) for the full design and [HANDOFF.md](HANDOFF.md) for
 implementation notes and conservation details.

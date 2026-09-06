@@ -344,6 +344,22 @@ fn ecology(
     }
     describe(&world);
 
+    // Said before the run rather than after it: a population whose best cell
+    // cannot fund a division inside a lifetime has no recovery leg available,
+    // and that is forty minutes you can decline to spend.
+    let cells = &world.config.cells;
+    let budget = cells.turnover_budget();
+    println!(
+        "turnover  division_reserve {:.2e} J against a budget of {:.2e} J -- {}",
+        cells.division_reserve,
+        budget,
+        if cells.division_reserve <= budget {
+            "a cell a standard deviation above the margin can fund a daughter"
+        } else {
+            "only the far tail of the population can fund a daughter, if anything can"
+        }
+    );
+
     let mut series = Series::new();
     let began = Instant::now();
     for _ in 0..ticks {
@@ -423,6 +439,11 @@ corpses {:>6}  food {:>10}",
     print!("{}", chart("corpses decomposing", &corpses, 72, 5));
     println!();
     print!("{}", chart("food: scarcest substrate", &substrate, 72, 8));
+    println!();
+    // The population's evolutionary state. A flat line here is a population of
+    // clones, which is the configuration that could never recover.
+    let uptake: Vec<f64> = alive.iter().map(|r| r.mean_uptake).collect();
+    print!("{}", chart("mean uptake trait", &uptake, 72, 5));
 
     let curve = curve_of(&world, &series);
     println!();
@@ -443,9 +464,17 @@ corpses {:>6}  food {:>10}",
     println!("  finish        {:>10}", curve.finish);
     println!("  births        {:>10}", world.cells.births);
     println!("  deaths        {:>10}", world.cells.deaths);
+    // Whether the plateau turns over. Without births after the peak there is
+    // no recovery leg available at all, however healthy the curve looks.
+    println!("  of which after the peak {:>3}", curve.births_after_peak);
     println!(
         "  food eaten    {:>10.2}x by the peak, {:.2}x back by the trough",
         curve.substrate_drawdown, curve.substrate_rebound
+    );
+    let traits = world.cells.trait_summary();
+    println!(
+        "  uptake trait  {:>10.3}  mean, spread {:.3}",
+        traits.mean_uptake, traits.uptake_spread
     );
     println!("  energy audit  {:>10.3e} relative drift", report.relative);
     println!();

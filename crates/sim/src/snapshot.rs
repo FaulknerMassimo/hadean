@@ -15,7 +15,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use hadean_cell::{Cell, CellState};
+use hadean_cell::{Cell, CellState, Traits};
 use hadean_chem::element::N_ELEMENTS;
 use hadean_core::hash::HashState;
 
@@ -24,7 +24,7 @@ use crate::config::WorldConfig;
 use crate::world::World;
 
 const MAGIC: &[u8; 8] = b"HADEANv1";
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 /// zstd level 3 is the usual sweet spot: most of the ratio, little of the cost.
 const COMPRESSION: i32 = 3;
 
@@ -70,6 +70,9 @@ pub fn save(world: &World) -> anyhow::Result<Vec<u8>> {
         put_f32(&mut raw, cell.age);
         raw.push(cell.state as u8);
         put_u32(&mut raw, cell.generation);
+        // Heritable state. A cell's traits are its ancestry, not a function of
+        // its id, so unlike its lifespan they cannot be re-derived on load.
+        put_f32(&mut raw, cell.traits.uptake);
     }
 
     let a = &world.audit;
@@ -170,6 +173,9 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
             value => anyhow::bail!("cell {id} has unknown state {value}"),
         };
         let generation = cursor.u32()?;
+        let traits = Traits {
+            uptake: cursor.f32()?,
+        };
         world.cells.cells.push(Cell {
             id,
             parent: (parent != u64::MAX).then_some(parent),
@@ -181,6 +187,7 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
             age,
             state,
             generation,
+            traits,
         });
     }
 
@@ -357,6 +364,10 @@ mod tests {
         // not know about is a hard error rather than a silent misread. That is
         // the right behaviour and it means every new state needs a decode arm;
         // this is the test that notices when one is missing.
+        //
+        // The traits go in off their default for the same reason: they are
+        // ancestry rather than a function of the cell's id, so a reader that
+        // skipped them would hand back a plausible cell that is not this one.
         let mut w = World::new(small()).expect("builds");
         w.run(40);
         w.cells.cells.push(Cell {
@@ -369,6 +380,7 @@ mod tests {
             damage: 0.25,
             age: 3.0,
             state: CellState::Dormant,
+            traits: Traits { uptake: 1.75 },
             generation: 2,
         });
         let digest = w.state_digest();

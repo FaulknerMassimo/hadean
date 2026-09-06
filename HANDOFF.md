@@ -7,11 +7,16 @@ Last updated during the Phase 2 population-tuning pass.
 The first hardcoded protocell is integrated: membrane transport, catalysed
 metabolism, energy reserve and maintenance, Brownian/flow motion, division,
 death, and conservative decomposition. Cell state participates in audits,
-hashes, snapshots, and CSV telemetry. The population now grows into a real
-resource limit rather than into the safety cap.
+hashes, snapshots, and CSV telemetry. Cells now carry a heritable trait and the
+pond selects on it, which is the first evolution here.
+
+**The live finding is in "The population is mining, not grazing".** The Phase 2
+gate is blocked upstream of the cell layer: on seed 1 the ancestor's food is
+made from a carbon pool with one way in and no way out, so there is nothing for
+a population to settle at. Read that section before tuning anything.
 
 ```
-mise exec -- cargo test --release --workspace          # 178 tests
+mise exec -- cargo test --release --workspace          # 185 tests
 mise exec -- cargo run -p hadean-headless --release -- verify --ticks 2000
   determinism ......... ok
   snapshot replay ..... ok
@@ -158,6 +163,24 @@ function of the cell's id, so a cell's allotted span is settled at birth,
 survives a snapshot and costs no state. `lifespan_spread = 0` restores the old
 shared lifespan exactly, which is worth knowing is a *mechanism* and not a
 simplification -- see "What the crash actually was".
+
+Cells carry **heritable traits**. Today that is one number, `uptake`, a
+multiplier on the cell's membrane permeability; a daughter inherits her
+mother's with a log-normal kick of `trait_spread`, and the founding cohort is
+drawn the same way. `trait_cost` is what stops it being a free dial: it is the
+fraction of a cell's upkeep that scales with the machinery it carries, so a
+hungrier cell is also a more expensive one. At `uptake = 1` the bill is exactly
+`maintenance_power` whatever `trait_cost` is, so a population of clones is
+unaffected by either dial and `trait_spread = 0` is the old cell layer exactly.
+
+This is a vestigial genome and it is deliberately not the one `PLAN.md`
+specifies -- a fixed struct of scalars cannot duplicate a gene, and gene
+duplication is the whole reason that plan calls for a byte string. What it is
+for is to carry inheritance, mutation and selection through the tick, the
+audit, the digest and the snapshot now, so that L3 replaces a mechanism that
+already works rather than introducing one. It is also *state*: unlike a
+lifespan, a cell's traits are its ancestry and cannot be re-derived from its
+id, so they are written into snapshots and the snapshot format is at 4.
 
 Cells are stepped in **voxel order**, not birth order. The order has to be
 fixed, because cells clamp against what the previous cell left in their shared
@@ -649,15 +672,242 @@ What each dial does, so the next person does not re-derive it:
 
 ---
 
+## Traits, and what variance is actually worth
+
+The section above ends by asking for variance between cells in what they need,
+and notes that it is L3's job anyway. That is what went in next: a `Traits`
+struct on the cell, one field, `uptake`, a multiplier on membrane permeability;
+a log-normal kick of `trait_spread` at every division, and the founding cohort
+drawn the same way. `trait_cost` is the brake -- the fraction of a cell's
+upkeep that scales with the machinery it carries -- and it is neutral at
+`uptake = 1`, so `trait_spread = 0` is the old cell layer to the bit.
+
+**The control says so.** `gate.toml` with `trait_spread = 0` reproduces the
+documented run exactly: peak 136 at tick 79400, births 136, deaths 136,
+extinct. Nothing about the new code perturbs a population of clones, and the
+conservation gate is unmoved -- `verify` still reports `-1.277e-13` relative
+drift, to the digit.
+
+**And at `trait_spread = 0.2` it changed almost nothing.** Peak 140 instead of
+136, and `births` 140 against a peak of 140: still not one cell born after the
+boom. The variation was really there -- the founding cohort opened at a spread
+of 0.19 and mutation carried the living population to 0.32 by the plateau --
+and it bought two divisions at t = 750 and none afterwards.
+
+### Why, in closed form
+
+This is the part worth keeping. Write a cell's income and its bill:
+
+```
+    income(u) = k u C e            bill(u) = m (1 - c + c u)
+```
+
+where `u` is the uptake trait, `c` is `trait_cost` and `m` is
+`maintenance_power`. A population eats down until its *marginal* cell breaks
+even, and that pins the water at `k C e = m (1 - c + c u_m) / u_m`. Now put a
+cell a fraction `d` better off than that one into the same water:
+
+```
+    surplus = m (1 - c + c u_m)(1 + d) - m (1 - c) - m c u_m (1 + d)
+            = m (1 - c) d
+```
+
+Everything but `d` and the two dials cancels. So the best cell in the pond
+funds a division in `division_reserve / (m (1 - c) d)` seconds, and it has to
+do that inside a lifetime:
+
+```
+    division_reserve  <  maintenance_power (1 - trait_cost) d maximum_age
+```
+
+For the gate at `d = 0.32`: `1e-11 x 0.5 x 0.32 x 2400 = 3.8e-9` J against a
+`division_reserve` of `1e-8`. **Short by a factor of two and a half**, which is
+exactly why nothing was born. The cells were varied; none of them could afford
+a daughter before it died of old age. `CellConfig::turnover_budget` computes
+this and `hadean ecology` prints it before the run, because it is forty minutes
+you can decline to spend.
+
+Two things follow that are not obvious from the earlier analysis:
+
+* **`maintenance_power` does not cancel here.** It cancels out of the night
+  bill -- that argument is in the section above and it still holds -- but a
+  bigger bill means a bigger income at break-even, so the same *fractional*
+  advantage is a bigger *absolute* surplus. It is the one place where making
+  cells more expensive makes the population more alive.
+* **The inequality is generous.** `income = k u C e` holds only while the
+  membrane is the bottleneck, and a cell that can take up faster than it can
+  metabolise gets less from each extra transporter: measured, `u = 1.5` earns
+  1.38 times the marginal cell rather than 1.5. A real population needs more
+  spread than the arithmetic asks for, not less. Against that, the best cell of
+  a few hundred is two or three standard deviations out rather than one, which
+  pushes back the other way.
+
+
+### What raising the spread bought
+
+Three runs at 250000 ticks on `gate.toml`, against the clone control:
+
+| run | `trait_spread` | `trait_cost` | `division_reserve` | peak | trough | finish | verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| control | 0 | -- | 1e-8 | 136 | 0 | 0 | extinct |
+| gate | 0.2 | 0.5 | 1e-8 | 140 | 0 | 0 | extinct |
+| A | 0.5 | 0.5 | 1e-8 | 156 | 5 | 5 | no recovery |
+| B | 0.5 | 0.25 | 1e-8 | 142 | 0 | 0 | extinct |
+| C | 0.5 | 0.25 | 3e-9 | 420 | 8 | 8 | no recovery |
+
+A and C are the first runs in this project that are **not extinct** at the end,
+and A's plateau is 156 against the control's 136 on the same food. But
+`births_after_peak` is zero in all five, so the recovery leg is still missing
+and the gate is still not met.
+
+**Selection is visible, and it runs both ways.** In A, `trait_cost = 0.5`, the
+five survivors have a mean uptake of 0.33 against the ancestor's 1.0: when the
+pond has been stripped, the cell that outlives the others is the *cheap* one.
+In C, `trait_cost = 0.25`, machinery costs less and the eight survivors come in
+at 1.63. Same mechanism, opposite direction, decided by which side of the
+trade-off the world is rewarding. That is the first evolution this simulation
+has done, and the dial that decides its direction is `trait_cost`.
+
+---
+
+## The population is mining, not grazing
+
+Then the food column was read properly, and it says something that reframes all
+of the above.
+
+Take the largest amount of food standing in the pond during each five-minute
+window of a run:
+
+| window | control (clones) | A (spread 0.5) |
+| --- | --- | --- |
+| 0-300 s | 1.15e13 | 1.15e13 |
+| 300-600 | 6.01e12 | 6.46e12 |
+| 600-900 | 1.19e12 | 1.15e12 |
+| 900-1200 | 2.30e11 | 1.91e11 |
+| 1200-1500 | 8.61e10 | 8.08e10 |
+| 1500-1800 | 7.01e9 | 5.76e9 |
+| 1800-2100 | 6.37e9 | 6.75e9 |
+| 2100-2400 | 1.03e9 | 1.37e9 |
+
+**Four orders of magnitude, and the two runs track each other**, though one
+carries 136 cells and the other 156. Every night's rebuild reaches roughly a
+tenth of the last one. There is no plateau to turn over because there is no
+carrying capacity: the pond is not producing at a rate the population lives
+off, it is a larder being emptied.
+
+The control that settles it is a pond with `membrane_scale = 0.001` and one
+cell that cannot eat -- the same trick that caught the fixed sun. **It holds
+1.15e13 flat through the entire run.** So the decline is the population's
+doing, not the pond running itself down.
+
+And the chemistry says why. On seed 1 the ancestor eats
+
+```
+    H2 + CH2O2S  ->  H2O + CH2OS          the metabolism, -82 kJ/mol
+    H2S + CO2    ->  CH2O2S               band 2, +81 kJ/mol, the only source
+```
+
+The food is made photochemically out of H2S and CO2, and **CO2 takes part in
+exactly one reaction in this chemistry** -- that one. So the pond's carbon has
+one way in to the food chain and, once the cells have turned CH2O2S into
+CH2OS, no way back out. The route home does exist and is downhill --
+`O2 + CH2OS -> CH2O3S` then `H2 + CH2O3S -> H2O + CH2O2S`, paid for by burning
+hydrogen -- but the first step has a rate constant of 8e-15 at 20 C, which is
+no route at all. Nothing in this world empties the sink. The waste is a dead
+end, and every turnover takes one more carbon out of circulation for good.
+
+That is not a cell-layer problem and no dial in `CellConfig` reaches it. **The
+population is not failing to regulate; it is mining a finite pool and the pool
+is running out.** A boom, a bust and a recovery need a renewable resource, and
+seed 1 does not have one for this metabolism.
+
+### What that means for choosing a metabolism
+
+`choose_metabolism` has now been wrong three times in the same direction, each
+time by trusting something that looked like food:
+
+1. one hop from sunlight -- picked a compound whose photoreaction had no
+   substrates;
+2. reachable in the network -- picked one at the end of an uphill chain that
+   never accumulates;
+3. **measured standing stock -- picks one the pond holds a great deal of and
+   cannot make any more of.**
+
+A large larder is not a living either. The measurement it wants next is a
+*rate*, not an amount: what the world can resupply per second, which is what a
+carrying capacity is made of. Two candidate readings, and neither is a graph
+walk:
+
+* **The vents are a known flux.** `fuel_rate x vents` particles per second of
+  each of the top `fuel_species` compounds, straight out of the config. A
+  metabolism running on vent fuel has a renewal rate that is not in doubt.
+* **A perturbation.** Take some of a candidate substrate out of the settled
+  lifeless pond and watch how fast it comes back. That is the honest general
+  answer and it costs a short extra run at set-up.
+
+Other seeds do offer vent-fed livings, which is the encouraging half of this.
+Probed at 16000 ticks:
+
+| seed | metabolism | substrates |
+| --- | --- | --- |
+| 2 | H2 + O2 -> H2O2 | both vent fuels |
+| 3 | O2 + HM -> HO2M | both vent fuels |
+| 5 | O2 + H2S -> H2O2S | both vent fuels |
+| 6 | H2S + CH3M | one vent fuel |
+| 7 | -- | no living at all |
+| 8 | H2S + OM2 | one vent fuel |
+
+`vents.fuel_species` is 2, so only the first two of the ranked list (HM, H2)
+are actually injected. Raising it to 5 puts O2 and H2S in the water at a known
+rate, and on seeds 2, 3 and 5 that makes the ancestor's whole diet renewable --
+a chemosynthetic vent community, which is what the vents were put in the world
+for.
+
+**That was tried, and on its own it is not enough.** Seeds 2 and 5 at
+`fuel_species = 5`, everything else `gate.toml`:
+
+* Seed 5's larder does what a renewed one should for a while -- it *rises*,
+  2.6e12 at t = 250 to 7.5e12 at t = 1000, against seed 1's monotonic decline.
+  Then it falls to 6e10 by t = 1500 and stays there, with only sixteen cells in
+  the pond, which is far too few to have eaten it. Something in the chemistry
+  is consuming the vent fuel faster than the vents deliver it.
+* Seed 2 collapses outright: 1.5e8 by t = 750 and 8e4 by t = 1250 on 69 cells.
+  It peaks at 69, draws its food down 13.3x, and is extinct by t = 1951.
+* Neither population divides much. The lifecycle numbers are tuned to seed 1's
+  reaction and its enthalpy, and on a different metabolism they are simply the
+  wrong size -- seed 5's cohort of sixteen never divides once.
+
+So the question is quantitative, not structural: `fuel_species` decides *what*
+is renewed and `fuel_rate` decides *how fast*, and 4e9 particles per second per
+vent is evidently not fast enough against what the network does with it. The
+measurement that settles it is the one asked for above -- the substrate's
+resupply rate, in a pond with the population in it -- and it should be taken
+before any more seeds are tried.
+
+---
+
 ## What is left
 
 ### Immediately outstanding
 
-1. The dormancy and lifespan work is uncommitted in the working tree.
-2. Finish the Phase 2 tuning: the shape of the problem has changed. The crash
-   is understood (synchronised ageing, now fixed by `lifespan_spread`) and the
-   recovery is blocked on there being no births at the plateau. See "What the
-   crash actually was".
+1. **Give the population a renewable living.** This is the one that matters and
+   it is not in `CellConfig`. See "The population is mining, not grazing": the
+   ancestor's food on seed 1 is made from a carbon pool with one way in and no
+   way out, so there is no carrying capacity to find. Two routes, and they are
+   complementary:
+   * Make `choose_metabolism` weigh a *rate* rather than a standing amount. The
+     vents' injection rate is exactly known from the config, and a perturbation
+     of the settled lifeless pond measures the rest. It has been wrong three
+     times now by trusting something that looked like food, and this is the
+     third correction, not a new idea.
+   * Raise `vents.fuel_species` past 2 so O2 and H2S reach the water, and run
+     the gate on a seed whose ancestor eats vent fuel — 2, 3 and 5 all do. That
+     is a chemosynthetic vent community, which is what the vents are for.
+2. The lifecycle numbers were tuned against seed 1's food chain. If the food
+   chain changes, `division_reserve`, `membrane_scale` and `maximum_age` all
+   have to be re-measured against it. Do not carry them over on trust; the
+   dials' *meanings* are documented in `CellConfig` and hold, their *values* do
+   not.
 3. `configs/pond.toml` carries the code's defaults, which are the *untuned*
    lifecycle numbers — the tuned ones live in `configs/gate.toml`. Once the
    gate passes, decide whether the defaults should move with it. They should
@@ -666,6 +916,10 @@ What each dial does, so the next person does not re-derive it:
 4. The tuned numbers have only been run at 24×24×10. The full pond is twice as
    deep, which changes both the light gradient and the volume behind each
    square metre of surface, so they may not carry over unchanged.
+5. `Traits` holds one field. `metabolic_rate` was left out of it deliberately:
+   at the configured 20/s the membrane is the bottleneck, so a trait on it
+   would be a dial attached to nothing, and this project has already learned
+   what one of those costs to diagnose. Add it when the regime changes.
 
 ### Phase 1 remainder
 
