@@ -166,6 +166,7 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
         let state = match cursor.byte()? {
             0 => CellState::Alive,
             1 => CellState::Decomposing,
+            2 => CellState::Dormant,
             value => anyhow::bail!("cell {id} has unknown state {value}"),
         };
         let generation = cursor.u32()?;
@@ -348,6 +349,34 @@ mod tests {
         assert_eq!(back.amounts.data, w.amounts.data);
         assert_eq!(back.heat.deviation.data, w.heat.deviation.data);
         assert_eq!(back.audit.ledger, w.audit.ledger);
+    }
+
+    #[test]
+    fn a_dormant_cell_survives_a_round_trip() {
+        // `CellState` is written as `state as u8`, so a state the reader does
+        // not know about is a hard error rather than a silent misread. That is
+        // the right behaviour and it means every new state needs a decode arm;
+        // this is the test that notices when one is missing.
+        let mut w = World::new(small()).expect("builds");
+        w.run(40);
+        w.cells.cells.push(Cell {
+            id: 9_000,
+            parent: None,
+            pos: [25.0e-6, 25.0e-6, 25.0e-6],
+            radius: w.config.cells.birth_radius,
+            contents: vec![0.0; w.chem.n_compounds()],
+            reserve: 1.0e-12,
+            damage: 0.25,
+            age: 3.0,
+            state: CellState::Dormant,
+            generation: 2,
+        });
+        let digest = w.state_digest();
+
+        let back = load(&save(&w).expect("saves")).expect("loads");
+        assert_eq!(back.state_digest(), digest);
+        assert_eq!(back.cells.dormant(), 1);
+        assert_eq!(back.cells.cells.last().expect("the cell"), w.cells.cells.last().expect("the cell"));
     }
 
     #[test]

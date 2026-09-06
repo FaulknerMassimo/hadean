@@ -15,7 +15,8 @@ cell's lifecycle.
 - L1 chemistry: atom graphs, generated reversible reactions, catalysis
 - L2 fields: conservative diffusion/advection, heat, light, static flow
 - L4 protocell (pre-genome): membrane transport, metabolism, maintenance,
-  Brownian motion, division, death, decomposition
+  Brownian motion, division, dormancy, individual lifespans, death,
+  decomposition
 - Headless CLI, compressed snapshots, replay verification, CSV telemetry
 - Population-curve analysis: boom, bust and recovery read out of a run rather
   than asserted
@@ -23,13 +24,28 @@ cell's lifecycle.
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
 place and the energetics are sized against the pond's measured photochemical
-output. `configs/gate.toml` holds the best configuration so far: it grows into
-its food supply, holds there for three days and nights without a single death,
-and then takes a genuine die-off — 136 cells to 26, with a hundred and ten
-corpses decomposing. **The survivors do not yet come back, so the gate is not
-met.** HANDOFF.md has the whole diagnosis, what each dial does, and the two
-candidate fixes. After that comes the L3 genome, which replaces the protocell's
-hardcoded traits.
+output. **The gate is not met**, and what stands between it and passing has
+narrowed a good deal.
+
+Cells now have dormancy — a cell that cannot pay its upkeep shuts down to a
+fraction of it and waits, rather than accruing damage against a reserve it does
+not have — and their own individual lifespans. Both matter, and neither is
+enough. Dormancy visibly works once it is given room to: a hundred and three of
+a hundred and thirty-six cells sit shut down while the pond is stripped to
+almost nothing, and not one of them dies.
+
+Two things were found by measurement along the way. The population's crash was
+never the famine it looked like — it was ageing, because every cell died at
+exactly the same age and the cohort that boomed together aged out together;
+lifting `maximum_age` makes the crash vanish outright. And underneath that, in
+ten runs across every combination of the dials, the population never divides
+after the initial boom. A population that never breeds cannot recover, so the
+gate's missing leg is not about survival at all. HANDOFF.md has the whole
+diagnosis and the candidates for what comes next.
+
+After Phase 2 comes the L3 genome, which replaces the protocell's hardcoded
+traits — and which may need to come first, since the variance between cells
+that a turning-over plateau seems to want is exactly what a genome provides.
 
 ## Run it
 

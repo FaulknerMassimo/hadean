@@ -313,6 +313,7 @@ fn report_audit(world: &World, series: &Series, span: u64) {
     println!();
     println!("cell population");
     println!("  alive         {:>14}", world.cells.alive());
+    println!("  dormant       {:>14}", world.cells.dormant());
     println!("  decomposing   {:>14}", world.cells.decomposing());
     println!("  births        {:>14}", world.cells.births);
     println!("  deaths        {:>14}", world.cells.deaths);
@@ -353,10 +354,12 @@ fn ecology(
             if progress > 0 && report.tick % progress == 0 {
                 let food = world.limiting_substrate();
                 println!(
-                    "  tick {:>10}  t = {:>9.1} s  cells {:>6}  corpses {:>6}  food {:>10}",
+                    "  tick {:>10}  t = {:>9.1} s  cells {:>6} ({:>5} dormant)  \
+corpses {:>6}  food {:>10}",
                     report.tick,
                     world.elapsed(),
                     world.cells.alive(),
+                    world.cells.dormant(),
                     world.cells.decomposing(),
                     // Infinite before the ancestors arrive: nothing eats yet,
                     // so nothing is scarce.
@@ -402,6 +405,7 @@ fn ecology(
     let populations: Vec<f64> = alive.iter().map(|r| r.population as f64).collect();
     let substrate: Vec<f64> = alive.iter().map(|r| r.substrate).collect();
     let corpses: Vec<f64> = alive.iter().map(|r| r.decomposing as f64).collect();
+    let dormant: Vec<f64> = alive.iter().map(|r| r.dormant as f64).collect();
     println!();
     println!(
         "{ticks} ticks ({:.1} s of world time) in {:.1} s",
@@ -410,6 +414,11 @@ fn ecology(
     );
     println!();
     print!("{}", chart("living cells", &populations, 72, 12));
+    println!();
+    // Plotted next to the population because it is the half of it that the
+    // population column cannot show: a flat line of cells sitting out a night
+    // and a flat line of cells working through one look identical up there.
+    print!("{}", chart("of which dormant", &dormant, 72, 5));
     println!();
     print!("{}", chart("corpses decomposing", &corpses, 72, 5));
     println!();

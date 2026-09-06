@@ -45,8 +45,42 @@ pub struct CellConfig {
     /// stops dead in the dark; a cohort that cannot outlast the dark does not
     /// have a bad night, it goes extinct by morning.
     pub starvation_time: f32,
-    /// Maximum lifespan in simulated seconds. Ageing makes death inevitable.
+    /// Mean lifespan in simulated seconds. Ageing makes death inevitable.
     pub maximum_age: f32,
+    /// Fractional spread of individual lifespans about `maximum_age`.
+    ///
+    /// Zero gives every cell the same lifespan to the tick, which sounds like
+    /// a simplification and is really a mechanism. Cells here are clones in a
+    /// shared voxel, so a cohort that is born together arrives at `maximum_age`
+    /// together and dies as one -- and a population that has settled at its
+    /// break-even concentration has no surplus to divide on, so nothing is
+    /// being born to replace them. That was the whole of the Phase 2 crash:
+    /// not a famine, an actuarial table with one row in it.
+    ///
+    /// The draw is a pure function of the cell's id, so a cell's allotted span
+    /// is fixed at birth, survives a snapshot, and costs no state.
+    pub lifespan_spread: f32,
+    /// Fraction of working maintenance power a dormant cell pays.
+    ///
+    /// This is the dial the night bill actually responds to. A population at
+    /// its carrying capacity eats what the world produces, so across a night
+    /// -- when photochemistry produces nothing -- it has to live on `P x T`
+    /// particles of standing stock, and every per-cell term cancels out of
+    /// that. Lowering `maintenance_power` does not help, because it raises the
+    /// standing population by exactly the factor it lowers each cell's bill.
+    /// Dormancy is outside that cancellation: it lowers the bill of the cells
+    /// that are shut down without raising how many of them the day supports.
+    ///
+    /// 1.0 disables dormancy, in the sense that a shut-down cell pays the same
+    /// as a working one and immediately wakes again.
+    pub dormancy_power_fraction: f64,
+    /// Seconds of working maintenance a dormant cell must bank before it wakes.
+    ///
+    /// Shutting down happens the moment a cell cannot pay its full upkeep;
+    /// waking is deliberately a much higher bar, so a cell sitting on the
+    /// margin does not flicker between the two states every tick and average
+    /// back into having no dormancy at all.
+    pub dormancy_exit: f32,
     /// Fraction of a corpse returned to the field per second.
     pub decomposition_rate: f32,
     /// Simulated seconds of lifeless chemistry before the ancestors appear.
@@ -75,6 +109,9 @@ impl Default for CellConfig {
             division_reserve: 2.0e-10,
             starvation_time: 120.0,
             maximum_age: 600.0,
+            lifespan_spread: 0.4,
+            dormancy_power_fraction: 0.05,
+            dormancy_exit: 60.0,
             decomposition_rate: 0.8,
             seed_delay: 150.0,
         }
@@ -95,6 +132,15 @@ impl CellConfig {
         if !(0.0..=1.0).contains(&self.capture_efficiency) {
             return Err("cell capture efficiency must be in 0..1".into());
         }
+        if !(0.0..=1.0).contains(&self.dormancy_power_fraction) {
+            return Err("cell dormancy power fraction must be in 0..1".into());
+        }
+        if self.dormancy_exit < 0.0 || !self.dormancy_exit.is_finite() {
+            return Err("cell dormancy exit must be a finite number of seconds".into());
+        }
+        if !(0.0..1.0).contains(&self.lifespan_spread) {
+            return Err("cell lifespan spread must be in 0..1".into());
+        }
         if self.seed_delay < 0.0 || !self.seed_delay.is_finite() {
             return Err("cell seed delay must be a finite number of seconds".into());
         }
@@ -110,10 +156,18 @@ impl CellConfig {
     }
 }
 
+/// Discriminants are part of the replay contract: they are hashed and written
+/// into snapshots as `state as u8`. Append new states, never reorder these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CellState {
     Alive,
     Decomposing,
+    /// Alive, but shut down to a fraction of working power to sit out a
+    /// famine. Its membrane and its catalysed reaction keep running -- those
+    /// are chemistry, not decisions the cell gets to make -- so a dormant cell
+    /// still takes up whatever the water offers, and banks it instead of
+    /// burning it. What it stops doing is paying full upkeep and growing.
+    Dormant,
 }
 
 /// A single protocell. Contents use `f64` because crossing a membrane between
@@ -134,8 +188,14 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// Living, whether or not it is currently working. A dormant cell is a
+    /// cell: it occupies the population, it can wake, and it is not a corpse.
     pub fn is_alive(&self) -> bool {
-        self.state == CellState::Alive
+        matches!(self.state, CellState::Alive | CellState::Dormant)
+    }
+
+    pub fn is_dormant(&self) -> bool {
+        self.state == CellState::Dormant
     }
 
     pub fn voxel(&self, grid: &Grid) -> usize {
@@ -268,6 +328,13 @@ impl Population {
         self.cells.len() - self.alive()
     }
 
+    /// Living cells currently shut down. Counted inside [`alive`](Self::alive),
+    /// and reported separately because a population that has gone quiet and one
+    /// that is working draw the same line on a population chart.
+    pub fn dormant(&self) -> usize {
+        self.cells.iter().filter(|c| c.is_dormant()).count()
+    }
+
     pub fn stored_energy(&self, chem: &Chemistry) -> Joules {
         self.cells
             .iter()
@@ -321,7 +388,12 @@ impl Population {
         for index in voxel_order(&self.cells, grid) {
             let cell = &mut self.cells[index as usize];
             match cell.state {
-                CellState::Alive => {
+                // Dormancy changes what a cell spends, not what physics does
+                // to it, so a shut-down cell drifts, exchanges and catalyses
+                // exactly as a working one does. The two differences are in
+                // `maintain`, which sets the bill and the state, and in
+                // division below.
+                CellState::Alive | CellState::Dormant => {
                     move_cell(
                         cell,
                         grid,
@@ -339,7 +411,12 @@ impl Population {
                     cell.age += dt as f32;
                     cell.radius = growth_radius(cfg, cell.reserve);
 
-                    if division_slots > 0
+                    // Only a cell paying its way divides. Dormancy is what
+                    // a cell does instead of growing, and `dormancy_exit` sits
+                    // far below `division_reserve` anyway, so a cell with the
+                    // reserve to split has long since woken up.
+                    if cell.state == CellState::Alive
+                        && division_slots > 0
                         && Schedule::due_for(tick, cell.id, growth_interval)
                         && cell.reserve >= cfg.division_reserve
                     {
@@ -350,7 +427,7 @@ impl Population {
                         daughters.push(child);
                     }
 
-                    if cell.damage >= 1.0 || cell.age >= cfg.maximum_age {
+                    if cell.damage >= 1.0 || cell.age >= lifespan(cfg, rng, cell.id) {
                         cell.state = CellState::Decomposing;
                         self.deaths += 1;
                     }
@@ -363,7 +440,7 @@ impl Population {
         // into an f32 field; this can take extra ticks when a transfer is below
         // the field's current ULP.
         self.cells.retain(|c| {
-            c.state == CellState::Alive
+            c.is_alive()
                 || c.reserve.abs() > 1.0e-25
                 || c.contents.iter().any(|&n| n.abs() > 1.0e-6)
         });
@@ -571,15 +648,67 @@ fn metabolize(
     cell.reserve += released - landed;
 }
 
+/// Pay for staying alive, and shut down rather than starve if that fails.
+///
+/// A cell that cannot meet its full bill used to keep trying out of a reserve
+/// it did not have, accruing damage at a fixed rate until it died -- and it
+/// kept eating the whole time, which is what stopped a crashed population from
+/// ever recovering: the survivors consumed the trickle that would have funded
+/// the comeback. A real cell facing famine stops instead. It drops its
+/// discretionary spending, holds what it has, and waits.
+///
+/// Note what dormancy does *not* switch off. Passive membrane exchange is
+/// diffusion down a gradient, and a catalyst the cell has already built goes
+/// on catalysing; neither is a decision. So a dormant cell keeps taking up
+/// what the water offers and banks it as reserve. Since its bill is
+/// `dormancy_power_fraction` of the working one, it breaks even at that much
+/// lower a food concentration -- which is exactly the refuge the population
+/// has never had, and the reason it can outlast a night that would kill it
+/// working.
 fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField, dt: f64) {
-    let due = cfg.maintenance_power * dt;
+    let working = cfg.maintenance_power * dt;
+    if cell.state == CellState::Alive && cell.reserve < working {
+        cell.state = CellState::Dormant;
+    }
+    let due = if cell.state == CellState::Dormant {
+        working * cfg.dormancy_power_fraction
+    } else {
+        working
+    };
+
     if cell.reserve >= due {
         let landed = heat.deposit(grid, cell.voxel(grid), due);
         cell.reserve -= landed;
         cell.damage = (cell.damage - dt as f32 / cfg.starvation_time).max(0.0);
     } else {
+        // Below even the dormant bill there is nothing left to cut, and
+        // `starvation_time` measures what it always did: how long a cell that
+        // cannot pay at all takes to die of it.
         cell.damage += dt as f32 / cfg.starvation_time;
     }
+
+    // Waking is a much higher bar than shutting down was. Without the gap a
+    // cell on the margin flickers between the two every tick and pays
+    // something close to the working bill on average, which is no dormancy at
+    // all.
+    if cell.state == CellState::Dormant
+        && cell.reserve >= cfg.maintenance_power * cfg.dormancy_exit as f64
+    {
+        cell.state = CellState::Alive;
+    }
+}
+
+/// How long this particular cell gets, in simulated seconds.
+///
+/// A pure function of the cell's id, so it is settled at birth, unchanged by a
+/// snapshot, and costs no per-cell state. `Purpose::Death` has been reserved
+/// for exactly this since L0 and is spent here.
+fn lifespan(cfg: &CellConfig, rng: &Counter, id: u64) -> f32 {
+    if cfg.lifespan_spread <= 0.0 {
+        return cfg.maximum_age;
+    }
+    let spread = cfg.lifespan_spread.clamp(0.0, 1.0);
+    cfg.maximum_age * rng.range(0, id, Purpose::Death, 0, 1.0 - spread, 1.0 + spread)
 }
 
 fn growth_radius(cfg: &CellConfig, reserve: Joules) -> f32 {
@@ -1124,5 +1253,237 @@ mod tests {
 
         assert_eq!(p.births, 3);
         assert_eq!(p.alive(), 2);
+    }
+
+    /// One cell against a fixed bill and a fixed income, stepped through
+    /// `maintain` alone.
+    ///
+    /// `income` is a multiple of the working maintenance bill, which is the
+    /// unit that matters: a pond offering less than 1.0 cannot keep a working
+    /// cell alive, and the question dormancy answers is how far below 1.0 a
+    /// cell can still persist.
+    fn dormancy_bench(
+        cfg: &CellConfig,
+        opening_seconds: f64,
+        income: f64,
+        ticks: usize,
+    ) -> (Cell, HeatField, Joules) {
+        let grid = Grid::new(2, 2, 2, 25.0e-6);
+        let mut heat = HeatField::new(&grid, 293.15);
+        let mut cell = Cell {
+            id: 0,
+            parent: None,
+            pos: [25.0e-6, 25.0e-6, 25.0e-6],
+            radius: cfg.birth_radius,
+            contents: vec![0.0; 4],
+            reserve: cfg.maintenance_power * opening_seconds,
+            damage: 0.0,
+            age: 0.0,
+            state: CellState::Alive,
+            generation: 0,
+        };
+        let dt = 0.01;
+        let opening = cell.reserve;
+        let mut earned = 0.0;
+        for _ in 0..ticks {
+            let pay = cfg.maintenance_power * dt * income;
+            cell.reserve += pay;
+            earned += pay;
+            maintain(&mut cell, cfg, &grid, &mut heat, dt);
+        }
+        (cell, heat, opening + earned)
+    }
+
+    #[test]
+    fn dormancy_lets_a_cell_live_on_a_trickle_that_would_starve_it_working() {
+        // This is the whole mechanism in one assertion. A cell breaks even at
+        // a fixed food concentration, so before this there was no refuge: when
+        // the pond fell below break-even it fell below break-even for every
+        // cell at once, and the population died as one. A cell that shuts down
+        // pays `dormancy_power_fraction` of its bill, so it breaks even that
+        // much lower down -- and a fifth of a living, which starves a working
+        // cell, is four times over what a dormant one needs.
+        let mut cfg = CellConfig::default();
+        cfg.dormancy_power_fraction = 0.05;
+        cfg.starvation_time = 100.0;
+
+        let (cell, ..) = dormancy_bench(&cfg, 10.0, 0.2, 100_000);
+        assert!(cell.is_alive(), "state {:?}", cell.state);
+        assert_eq!(cell.damage, 0.0, "a cell inside its dormant means took damage");
+
+        // The control is the same thousand seconds with dormancy disabled,
+        // which is what the cell layer did before: pay in full, or accrue
+        // damage against a reserve you do not have until it kills you.
+        let mut off = cfg;
+        off.dormancy_power_fraction = 1.0;
+        off.dormancy_exit = 0.0;
+        let (control, ..) = dormancy_bench(&off, 10.0, 0.2, 100_000);
+        assert!(
+            control.damage >= 1.0,
+            "control should have starved on a fifth of a living, damage {}",
+            control.damage
+        );
+    }
+
+    #[test]
+    fn dormancy_spends_from_the_same_ledger() {
+        // A smaller bill is still a bill. Whatever leaves the reserve has to
+        // arrive in the heat field, or dormancy is a hole in the energy audit
+        // rather than a cheaper way to live.
+        let mut cfg = CellConfig::default();
+        cfg.dormancy_power_fraction = 0.1;
+        let grid = Grid::new(2, 2, 2, 25.0e-6);
+        let (cell, heat, taken_in) = dormancy_bench(&cfg, 1.0, 0.0, 5_000);
+        assert_eq!(cell.state, CellState::Dormant);
+
+        let spent = taken_in - cell.reserve;
+        let landed = heat.energy(&grid);
+        assert!(
+            (spent - landed).abs() <= 1.0e-24,
+            "reserve fell {spent} J, heat rose {landed} J"
+        );
+    }
+
+    #[test]
+    fn shutting_down_comes_before_taking_damage() {
+        // Order matters. A cell must shut down while it can still pay, and
+        // start accruing damage only once even the dormant bill is beyond it.
+        // The reverse -- damage first, dormancy as a death rattle -- would buy
+        // the population nothing.
+        //
+        // With nothing at all coming in this cell still dies, and that is
+        // correct: dormancy is a cheaper way to live off a trickle, not a way
+        // to live off nothing.
+        let mut cfg = CellConfig::default();
+        cfg.dormancy_power_fraction = 0.05;
+        cfg.starvation_time = 1000.0;
+        let grid = Grid::new(2, 2, 2, 25.0e-6);
+        let mut heat = HeatField::new(&grid, 293.15);
+        let mut cell = Cell {
+            id: 0,
+            parent: None,
+            pos: [25.0e-6, 25.0e-6, 25.0e-6],
+            radius: cfg.birth_radius,
+            contents: vec![0.0; 4],
+            reserve: cfg.maintenance_power,
+            damage: 0.0,
+            age: 0.0,
+            state: CellState::Alive,
+            generation: 0,
+        };
+
+        let mut shut_down_at = None;
+        for tick in 0..1_000 {
+            maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+            if shut_down_at.is_none() && cell.state == CellState::Dormant {
+                shut_down_at = Some(tick);
+                assert_eq!(cell.damage, 0.0, "took damage before shutting down");
+            }
+        }
+        let shut_down_at = shut_down_at.expect("never shut down");
+        assert!(cell.damage > 0.0, "never started starving after shutting down");
+        // One second of upkeep in the bank, spent at the working rate.
+        assert!(
+            (95..=105).contains(&shut_down_at),
+            "shut down at tick {shut_down_at}, expected about 100"
+        );
+    }
+
+    #[test]
+    fn waking_is_a_higher_bar_than_shutting_down_was() {
+        // Without the gap a cell on the margin flickers in and out every tick
+        // and pays something close to the working bill on average, which is no
+        // dormancy at all.
+        let mut cfg = CellConfig::default();
+        cfg.dormancy_power_fraction = 0.05;
+        cfg.dormancy_exit = 60.0;
+        let (mut cell, mut heat, _) = dormancy_bench(&cfg, 0.5, 0.0, 100);
+        assert_eq!(cell.state, CellState::Dormant);
+        let grid = Grid::new(2, 2, 2, 25.0e-6);
+
+        // A windfall short of the waking threshold leaves it shut down.
+        cell.reserve = cfg.maintenance_power * 59.0;
+        maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+        assert_eq!(cell.state, CellState::Dormant);
+
+        // One that clears it puts the cell back to work.
+        cell.reserve = cfg.maintenance_power * 61.0;
+        maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+        assert_eq!(cell.state, CellState::Alive);
+    }
+
+    #[test]
+    fn a_dormant_cell_does_not_divide() {
+        // Reserve alone is not licence to split: a cell that is shut down is
+        // shut down, and dividing on the way past the waking threshold would
+        // let a famine produce offspring.
+        let (mut cfg, grid, chem, rng, mut amounts, mut residual, mut heat, flow) = setup();
+        cfg.membrane_scale = 0.0;
+        cfg.metabolic_rate = 0.0;
+        // Enough reserve to divide on, and still short of the waking
+        // threshold, so the cell is genuinely dormant when the check runs.
+        cfg.dormancy_exit = 10_000.0;
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        for cell in &mut p.cells {
+            cell.state = CellState::Dormant;
+            cell.reserve = cfg.division_reserve * 10.0;
+        }
+        assert!(
+            cfg.division_reserve * 10.0 < cfg.maintenance_power * cfg.dormancy_exit as f64,
+            "the test must keep the cell below its waking threshold"
+        );
+        let before = p.births;
+        p.step(
+            &cfg, &grid, &chem, &flow, &rng, 0, 0.01, 1, &mut amounts, &mut residual, &mut heat,
+        );
+        assert_eq!(p.births, before, "a dormant cell divided");
+    }
+
+    #[test]
+    fn every_cell_gets_its_own_allotted_span() {
+        // A shared lifespan is not a simplification, it is a synchroniser: a
+        // cohort born together dies together, and a population sitting at
+        // break-even has no surplus to breed replacements out of. The spread
+        // is what turns a plateau from a freeze into a turnover.
+        let mut cfg = CellConfig::default();
+        cfg.maximum_age = 1000.0;
+        cfg.lifespan_spread = 0.4;
+        let rng = Counter::new(7);
+
+        let spans: Vec<f32> = (0..500).map(|id| lifespan(&cfg, &rng, id)).collect();
+        for &span in &spans {
+            assert!(
+                (600.0..=1400.0).contains(&span),
+                "span {span} outside the configured spread"
+            );
+        }
+        let lowest = spans.iter().cloned().fold(f32::INFINITY, f32::min);
+        let highest = spans.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            highest - lowest > 500.0,
+            "spans cover only {} s, which will not desynchronise a cohort",
+            highest - lowest
+        );
+
+        // Settled at birth: asking twice must give the same answer, or a
+        // cell's death would depend on when the question was asked.
+        assert_eq!(spans[42], lifespan(&cfg, &rng, 42));
+
+        // And zero spread is still the old fixed-age world, exactly.
+        cfg.lifespan_spread = 0.0;
+        assert_eq!(lifespan(&cfg, &rng, 42), cfg.maximum_age);
+    }
+
+    #[test]
+    fn dormant_cells_count_as_living() {
+        // They occupy the population and the safety cap, and they are not
+        // corpses. `decomposing` is derived from `alive`, so getting this
+        // wrong reports a sleeping pond as a mass grave.
+        let (cfg, grid, chem, rng, amounts, ..) = setup();
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        p.cells[0].state = CellState::Dormant;
+        assert_eq!(p.alive(), 2);
+        assert_eq!(p.dormant(), 1);
+        assert_eq!(p.decomposing(), 0);
     }
 }

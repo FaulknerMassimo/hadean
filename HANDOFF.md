@@ -11,7 +11,7 @@ hashes, snapshots, and CSV telemetry. The population now grows into a real
 resource limit rather than into the safety cap.
 
 ```
-mise exec -- cargo test --release --workspace          # 170 tests
+mise exec -- cargo test --release --workspace          # 178 tests
 mise exec -- cargo run -p hadean-headless --release -- verify --ticks 2000
   determinism ......... ok
   snapshot replay ..... ok
@@ -30,8 +30,8 @@ was changed.
 **Every cargo command must be prefixed with `mise exec --`**, or run `mise install`
 and let the shims take over.
 
-`git init` was run but **nothing has been committed**. There is no initial commit;
-the working tree is entirely untracked. `.gitignore` is in place.
+There is one commit. The dormancy and lifespan-spread work described below is
+uncommitted in the working tree.
 
 No GPU is available in this environment (`nvidia-smi` fails), so everything is the
 CPU reference implementation. `wgpu` has not been introduced yet.
@@ -140,6 +140,24 @@ compounds through a passive membrane, captures energy from one exergonic
 pathway, pays continuous maintenance, moves with flow plus Brownian motion, and
 divides after accumulating enough reserve. Age or starvation kills it;
 decomposition returns its compounds and reserve to the fields.
+
+A cell that cannot pay its upkeep enters `CellState::Dormant` rather than
+running up damage against a reserve it does not have: it drops to
+`dormancy_power_fraction` of its bill and does not divide, but keeps its
+membrane and its catalyst, because passive diffusion and a catalyst already
+built are not decisions a cell gets to make. It wakes once it has banked
+`dormancy_exit` seconds of working upkeep, a deliberately higher bar than
+shutting down was -- without the gap a cell on the margin flickers every tick
+and averages back into having no dormancy at all. Dormant cells count as alive
+everywhere: in `alive()`, in the safety cap, and in the population column, with
+a separate `dormant` column beside it because a cohort sitting out a night and
+one working through it draw the same line.
+
+Lifespans are per cell. `lifespan()` draws on `Purpose::Death` as a pure
+function of the cell's id, so a cell's allotted span is settled at birth,
+survives a snapshot and costs no state. `lifespan_spread = 0` restores the old
+shared lifespan exactly, which is worth knowing is a *mechanism* and not a
+simplification -- see "What the crash actually was".
 
 Cells are stepped in **voxel order**, not birth order. The order has to be
 fixed, because cells clamp against what the previous cell left in their shared
@@ -505,6 +523,110 @@ keeps eating the trickle and so prevents the recovery that would save it.
 `PLAN.md` files behaviour under Phase 4; this world needs it in Phase 2,
 because this world has nights.
 
+---
+
+## What the crash actually was
+
+Everything above this line is the tuning as it stood, and the diagnosis in it
+is wrong. It is kept because the measurements are real and because the way it
+was wrong is worth knowing.
+
+Dormancy went in as the mechanism the section above asks for, and it works: a
+cell that cannot pay its full upkeep shuts down to `dormancy_power_fraction` of
+it, keeps its membrane and its catalyst running because neither is a decision
+it gets to make, and so breaks even at a food concentration that much lower.
+The unit tests hold it to that. Then it was run against the gate, with a
+control that disables it, and the control reproduced `configs/gate.toml`'s
+documented behaviour exactly -- 136 cells, then 26 with 110 corpses, then zero.
+
+**Dormancy made almost no difference, and `dormancy_power_fraction` turned out
+not to matter at all.** 0.05, 0.005 and 0.0005 -- a four-thousandfold range --
+produce the same trajectory to the cell. A dial that inert is not a weak dial,
+it is a dial attached to nothing, and it says the population was not dying of
+its maintenance bill.
+
+Two experiments found what it was dying of.
+
+**One: the crash was ageing, not famine.** `maximum_age` was 1200 s and the
+die-off lands at t = 1250-1500. Setting `maximum_age` to 1e9 -- or merely
+doubling it to 2400 -- makes the die-off *vanish*: 136 cells and zero corpses
+straight through the night that had been killing a hundred and ten of them.
+Every cell died at exactly the same age, so the cohort that boomed together
+aged out together. The night was innocent. So was the night bill, and so is the
+whole `P x T` argument above as an account of *this* crash -- the arithmetic is
+right, it just was not what was happening.
+
+That run is also where dormancy finally shows itself doing its job: with ageing
+out of the way, 103 of 136 cells sit shut down while the pond is stripped to
+4.6e6 particles, and not one of them dies. Under the old cell layer that
+population was dead.
+
+**Two: nothing is ever born after the boom.** Across all six runs -- control,
+dormancy at three fractions, and both ageing variants -- the counters read
+`births 136, deaths 136` against a peak of 136. Not one division after
+t = 790 s, in any configuration.
+
+That is the missing recovery leg, and it is arithmetic rather than ecology: a
+population cannot recover without births. A cell divides on `division_reserve`
+= 1e-8 J, which is about five hundred seconds of accumulating at full surplus,
+and a population that has settled at its break-even concentration has by
+definition no surplus at all. The plateau is not a carrying capacity. It is a
+hundred and thirty-six identical clones arriving at break-even together and
+freezing there.
+
+Giving every cell its own lifespan (`lifespan_spread`, a draw on `Purpose::Death`
+that is a pure function of the cell's id) desynchronises the die-off exactly as
+intended -- deaths become a trickle from t = 1000 rather than a wall at 1400 --
+and it is still not enough on its own. The food one corpse returns is a
+hundred-and-thirty-sixth of the standing stock, spread across the field for
+everyone, and no survivor can bank 1e-8 J out of a transient that small.
+
+**So the live tension is between two jobs `division_reserve` is doing at once.**
+It has to be large to damp the boom -- that is the finding above, and it holds --
+and it has to be small enough that a cell can divide on the surplus a death
+frees, or the plateau has no turnover and there is nothing to recover with.
+
+That pairing was then run, staggered mortality with a cheaper division, and it
+does not resolve it. Lower division costs buy a bigger boom, not a turnover:
+
+| `division_reserve` | peak | after the boom |
+| --- | --- | --- |
+| 1e-8 | 136 | 0 births, gradual decline to extinction |
+| 3e-9 | 432 | 0 births, strips the pond, 100% dormant by t = 1000 |
+| 1e-9 | 1031 | 0 births, strips the pond to 4.6e3, 100% dormant |
+
+The population overshoots until the pond is stripped, shuts down *entirely*,
+and then declines. It never divides again at any setting.
+
+Dormancy also introduces a failure mode of its own, worth knowing before
+reaching for it: **a permanently sleeping population.** From t = 1000 the whole
+population is dormant, and it cannot clear `dormancy_exit` to wake because the
+pond never recovers far enough while they are all still drawing on it. The
+obvious fix is the wrong one -- dropping `dormancy_exit` from 60 to 5 makes the
+run worse, not better, because cheap waking puts cells back onto full spending
+in a pond that cannot support it, and both populations then go extinct outright
+rather than declining. The high bar was doing useful work.
+
+**Where that leaves it.** Ten runs, and `births` equals the peak population in
+every one of them. The gate's missing leg is not survival, tolerance, or
+energetics; it is that nothing is ever born after the boom. Whatever comes next
+has to make a plateau that turns over -- births and deaths both nonzero at
+carrying capacity -- and no combination of the existing dials produces one. The
+population regulates by every clone simultaneously arriving at break-even and
+stopping, which is a freeze, not a carrying capacity, and the freeze is what
+has to go. Candidates, in the order I would try them:
+
+* **Variance between cells in what they need**, not just in how long they live.
+  Identical clones in a shared voxel is what makes break-even collective. Some
+  heritable spread in `membrane_scale` or `metabolic_rate` would mean the
+  population thins from the bottom while the best cells keep a surplus -- and
+  it is L3's job anyway, which is an argument for letting the genome arrive
+  before the gate rather than after it.
+* **A refuge**, so a shortage is not simultaneous everywhere. The pond is
+  0.25 mm deep and well mixed; the light gradient is the only structure in it.
+* **Density-dependent division** rather than a fixed reserve threshold, so the
+  cost of dividing falls as the population thins.
+
 What each dial does, so the next person does not re-derive it:
 
 * `division_reserve` sets how fast the population can respond, and it has to be
@@ -515,8 +637,15 @@ What each dial does, so the next person does not re-derive it:
 * `maintenance_power` sets the standing population, and cancels out of the
   night bill entirely. It is not the dial it looks like.
 * `membrane_scale` sets the concentration the population stops eating at, and
-  so how much food is left standing when the sun goes down. On the evidence
-  above this is the one to turn.
+  so how much food is left standing when the sun goes down.
+* `maximum_age` was doing far more than ageing. With `lifespan_spread` at zero
+  it is a synchroniser: it decides the date on which an entire cohort dies at
+  once, and that -- not the night -- was the Phase 2 crash.
+* `lifespan_spread` breaks that synchrony. It converts a cliff into a trickle,
+  which is necessary for turnover and not sufficient for it.
+* `dormancy_power_fraction` sets how far below break-even a shut-down cell can
+  still live. It is inert while something else is doing the killing, which is
+  how the ageing diagnosis was found.
 
 ---
 
@@ -524,9 +653,11 @@ What each dial does, so the next person does not re-derive it:
 
 ### Immediately outstanding
 
-1. **Not committed to git.** No initial commit exists.
-2. Finish the Phase 2 tuning above: the population now persists, and the gate
-   still wants a crash and a recovery out of it.
+1. The dormancy and lifespan work is uncommitted in the working tree.
+2. Finish the Phase 2 tuning: the shape of the problem has changed. The crash
+   is understood (synchronised ageing, now fixed by `lifespan_spread`) and the
+   recovery is blocked on there being no births at the plateau. See "What the
+   crash actually was".
 3. `configs/pond.toml` carries the code's defaults, which are the *untuned*
    lifecycle numbers — the tuned ones live in `configs/gate.toml`. Once the
    gate passes, decide whether the defaults should move with it. They should

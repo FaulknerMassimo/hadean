@@ -25,8 +25,41 @@
 #                              that cannot outlast the dark does not have a bad
 #                              night, it goes extinct by morning.
 #
-#   maximum_age = 1200         Two day cycles. Long enough that ageing is not
-#                              what regulates the population -- food is.
+#   maximum_age = 2400         Was 1200, and 1200 turned out to be the thing
+#   lifespan_spread = 0.4      that was killing the population. Every cell died
+#                              at exactly `maximum_age`, so the cohort that
+#                              boomed together aged out together, and the
+#                              die-off that looked like a famine landed at
+#                              t = 1250-1500 for no other reason. Setting this
+#                              to 1e9 makes the crash vanish outright: 136
+#                              cells, zero corpses, straight through the night
+#                              that had been killing a hundred and ten of them.
+#                              The spread is the real fix -- each cell draws its
+#                              own span, so a cohort dies over a window instead
+#                              of on a date -- and the doubled mean keeps
+#                              ageing clear of the first few cycles while the
+#                              food dynamics are being read.
+#
+#   dormancy_power_fraction    A cell that cannot pay its upkeep shuts down to a
+#     = 0.05                   twentieth of it rather than running up damage
+#   dormancy_exit = 60         against a reserve it does not have. It keeps its
+#                              membrane and its catalyst -- neither is a
+#                              decision -- so it goes on banking whatever the
+#                              water offers, and breaks even that much further
+#                              down. With ageing out of the way this visibly
+#                              works: 103 of 136 cells sit shut down while the
+#                              pond is stripped to 4.6e6 particles and not one
+#                              of them dies.
+#
+#                              The fraction is not a dial to reach for. Between
+#                              0.05, 0.005 and 0.0005 the run does not change by
+#                              a single cell, because while something else is
+#                              doing the killing the maintenance bill is not
+#                              what any of this turns on. `dormancy_exit` does
+#                              matter, and in the direction that is easy to get
+#                              backwards: dropping it from 60 to 5 makes things
+#                              worse, because cheap waking puts cells back on
+#                              full spending into a pond that cannot pay for it.
 #
 #   membrane_scale = 1000      The one that mattered most, and the last to be
 #                              found. A cell stops eating at the concentration
@@ -38,6 +71,16 @@
 #                              strip the pond bare and starve in the dark; the
 #                              night bill works out at about a night's worth of
 #                              production, which puts this near a thousand.
+#
+# What this config does NOT do is meet the gate, and the reason has narrowed a
+# long way. In every configuration tried -- with and without dormancy, across
+# four thousandfold of `dormancy_power_fraction`, with ageing on, doubled and
+# off, and with `division_reserve` from 1e-8 down to 1e-9 -- the run ends with
+# `births` exactly equal to the peak population. Not one cell divides after the
+# boom. A population that never breeds cannot recover, so the missing leg of the
+# gate is not a survival problem at all; it is that the plateau is a hundred and
+# thirty-six clones arriving at break-even together and freezing there, with no
+# surplus to divide on and nothing to turn over. See HANDOFF.md.
 #
 # The sun deliberately still rises and sets. A fixed sun looks like better
 # experiment control and is not: it drains the photoreaction's precursor and
@@ -113,6 +156,9 @@ capture_efficiency = 0.6
 maintenance_power = 1.0e-11
 division_reserve = 1.0e-8
 starvation_time = 300.0
-maximum_age = 1200.0
+maximum_age = 2400.0
+lifespan_spread = 0.4
+dormancy_power_fraction = 0.05
+dormancy_exit = 60.0
 decomposition_rate = 0.8
 seed_delay = 150.0

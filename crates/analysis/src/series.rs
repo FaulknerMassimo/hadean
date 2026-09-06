@@ -34,6 +34,13 @@ pub struct Row {
     pub floor_temperature: f64,
     pub surface_light: f64,
     pub population: u64,
+    /// Living cells currently shut down, counted inside `population`.
+    ///
+    /// Recorded separately because dormancy is invisible in the population
+    /// column by construction: a cohort that goes quiet and waits out a night
+    /// draws the same flat line as one that is working through it, and the
+    /// difference between those two is the whole point of the mechanism.
+    pub dormant: u64,
     pub decomposing: u64,
     pub births: u64,
     pub deaths: u64,
@@ -47,7 +54,7 @@ impl Row {
     pub const HEADER: &'static str = "tick,elapsed_s,chemical_j,thermal_j,total_j,expected_j,\
 drift_j,relative_drift,mass_drift,light_in_j,radiated_out_j,vent_heat_in_j,\
 mean_temperature_k,surface_temperature_k,floor_temperature_k,surface_light_w_m2,\
-population,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
+population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
 
     /// Take a reading from a world and its latest audit.
     pub fn sample(world: &World, report: &AuditReport) -> Self {
@@ -71,6 +78,7 @@ population,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
             floor_temperature: temperature.last().copied().unwrap_or(0.0),
             surface_light: light.first().copied().unwrap_or(0.0),
             population: world.cells.alive() as u64,
+            dormant: world.cells.dormant() as u64,
             decomposing: world.cells.decomposing() as u64,
             births: world.cells.births,
             deaths: world.cells.deaths,
@@ -81,7 +89,7 @@ population,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
 
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.9e},{:.9e}",
+            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e}",
             self.tick,
             self.elapsed,
             self.chemical,
@@ -99,6 +107,7 @@ population,decomposing,births,deaths,cellular_reserve_j,substrate_particles";
             self.floor_temperature,
             self.surface_light,
             self.population,
+            self.dormant,
             self.decomposing,
             self.births,
             self.deaths,
