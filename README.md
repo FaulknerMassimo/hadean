@@ -33,12 +33,15 @@ cell's lifecycle.
 - `hadean supply`: what the pond can *resupply*, measured rather than guessed
   — it settles a lifeless world, takes a compound out of it, and keeps taking
   every particle the chemistry makes of it, so what comes back is the largest
-  harvest the world will sustain
+  harvest the world will sustain; and, since a probe exports matter and only a
+  vent brings any in, how much of that harvest the world's inflow could
+  actually pay for
 
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
-place. **The gate is not met**, and the reason has moved four times — the first
-three were the cell, and the fourth was not.
+place. **The gate is not met**, and the reason has moved five times — the first
+three were the cell, the fourth was what the cells were given to eat, and the
+fifth was the instrument that chose it.
 
 It was thought to be a famine, and it was ageing: every cell died at exactly
 the same age, so the cohort that boomed together aged out together. Individual
@@ -75,12 +78,40 @@ On seed 1 it says:
   CH2O2S        1.150e13   3.048e9/s    1.027e7/s    0.003  larder
 ```
 
-`CH2O2S` is what every run in this project was handed. The pond holds six
-hundred times more of it than of `HO2M` and rebuilds eight hundred times less.
-Ranked by amount the ancestor gets a stock of ten million meals with nothing
-behind it; ranked by rate it should have had `HO2M + HM -> 2 HOM`, which
-sustains 4.554e-9 W where the ancestral reaction sustains 8.4e-13 — **a factor
-of five thousand in the living the pond can actually pay.**
+`CH2O2S` is what every run in this project was handed, and ranked by amount the
+ancestor gets a stock of ten million meals with nothing behind it. Ranked by
+rate it was given `HO2M + HM -> 2 HOM` instead, worth five thousand times the
+sustainable power.
+
+**That was a larder too, and the same column that caught the first one
+endorsed it.** `holding` is a rate held across a window, and a stock drained at
+a constant speed holds its rate perfectly — holding its rate is what a constant
+speed *is*. HO2M scored 1.231, accelerating, and it is built from oxygen, which
+`vents.fuel_species = 2` does not deliver at any rate at all. The pond retires
+its own oxygen in 2200 seconds with nothing living in it: probed at that settle
+rather than at the 150 seconds `choose_metabolism` reads, the same lifeless
+world reports HO2M's resupply down by a factor of 1.94e5 and O2 as a dead end.
+
+So `supply` now reports a `funded` column beside the measured rate — the
+largest harvest the vents' matter inflow could pay for, taken off the audit's
+element ledger. Two of twenty-two candidates on this pond come back renewed,
+and they are the two the vents inject:
+
+```
+inflow    the vents deliver H 3.600e10, M 1.200e10 atoms per second
+
+  compound     standing      opening    sustained       funded  holding
+  H2           1.333e13   1.215e10/s   1.213e10/s   1.800e10/s    0.998  renewed
+  HM           4.621e11   1.208e10/s   1.205e10/s   1.200e10/s    0.998  renewed
+  HO2M         1.854e10    6.920e9/s    8.817e9/s    0.000e0/s    1.274  stock - no O enters this pond
+```
+
+The bound is on the *probe*, which exports matter, and not on a population,
+which does not — a cell turns its substrate into products and leaves every atom
+in the pond, so a living can be sustained by matter that never enters at all
+provided photochemistry drives the products back. `supply` says so in its own
+output rather than leaving it to be inferred, and the measurement that would
+settle it does not exist yet.
 
 That also settles the `division_reserve` question underneath it. Swept over
 four and a half octaves, the dial buys peak population and nothing else: the
@@ -115,12 +146,18 @@ character with it: under the larder every night's rebuild reached a tenth of
 the last one, four orders down and never up, and here it falls to 2.4e3 and is
 back at 5.2e6 ten thousand ticks later.
 
-**The gate is still not met**, and the reason is now dull rather than deep:
-both runs were *still crashing when the clock ran out*. Growing into a supply
+**The gate is still not met.** Both runs were still crashing when the clock ran
+out, and for a while that looked like the whole of it — growing into a supply
 takes seven times longer than sprinting through a stock, so the peak lands at
-tick 187 000 where the larder's landed at 26 000, and 250 000 ticks — a run
-length calibrated against the other pond — does not reach the far side. A
-longer horizon is the next thing, rather than a mechanism that does not exist.
+tick 187 000 where the larder's landed at 26 000. It was not the whole of it.
+`renewA` ends with its population entirely dormant, nothing eating, and the
+food still falling; the substrate's oxygen has no way into this pond and was
+never coming back. The 17 333-cell boom and the 193 births are real
+measurements of what those cells did. They were done on a larger larder.
+
+What is next is not a longer horizon. It is `vents.fuel_species = 5`, which
+puts O2 in the water and makes that diet vent-fed on both sides — one line, and
+`supply`'s new column can now judge it before a run is spent on it.
 
 `configs/evolve.toml` is the gate pond with the genome switched on; a test
 enforces that the two differ in nothing but the cell. `cells.genome` is off by
@@ -151,6 +188,8 @@ mise exec -- cargo run -p hadean-headless --release -- ecology \
   --config configs/evolve.toml --ticks 250000
 mise exec -- cargo run -p hadean-headless --release -- supply \
   --config configs/gate.toml --probe 600
+mise exec -- cargo run -p hadean-headless --release -- supply \
+  --config configs/renew.toml --settle 2200 --probe 600
 mise exec -- cargo run -p hadean-headless --release -- chem --keys
 mise exec -- cargo test --release --workspace
 ```
@@ -171,6 +210,17 @@ the pond cannot refill. This one is a rate, and it is taken by perturbing the
 world rather than by reading its graph: take the compound away, keep taking it,
 and see what the chemistry does about it. Its answer goes into a config as
 `cells.metabolism`, the same way `chem --keys` sets `enzyme_sigma`.
+
+It reports two numbers for that rate and both matter. `sustained` is what the
+chemistry actually handed over in the last window. `funded` is the most the
+world's *matter inflow* could have paid for, off the audit's element ledger:
+a probe exports matter, and only a vent brings any in — a photon carries
+energy, not matter, and can rearrange an atom but cannot deliver one. The
+bound is deliberately generous, crediting one compound with every atom the
+vents delivered, so a compound reading zero there is not being resupplied at
+all. Read `--settle` as part of the measurement rather than as setup: it
+defaults to `seed_delay`, which is the instant the ancestors choose a diet, and
+on `renew.toml` that instant is a transient.
 
 `chem --keys` is the measurement behind the genome's recognition widths: it
 reports how far apart the chemistry's affinity keys actually are, and how many

@@ -1787,6 +1787,185 @@ starts to move.
 longer horizon, rather than a mechanism that does not exist. An 800000-tick run
 of `renew.toml` is the next thing, and it is running.
 
+## The larder that held its rate, and the element that was never coming back
+
+`hadean supply` exists because `choose_metabolism` had been wrong three times
+by reading an amount where a rate was wanted. It was wrong a fourth time, in
+its own column, and the shape of that error is worth more than the fix is.
+
+The 250000-tick `renew.toml` runs ended with the population entirely dormant
+and still falling. The last line of `renewA` says why:
+
+```
+food        1 HO2M (3.417e6 left) + 1 HM (2.428e12 left)
+```
+
+HM, the vent fuel, is untouched at 2.4e12. HO2M is gone. Between tick 220000
+and 250000 the pond is **100% dormant** -- 16275 of 16277 cells asleep, nothing
+eating -- and HO2M still falls, 4.2e4 to 5.4e3. Against the measured 8.512e9/s,
+three hundred seconds of a sleeping pond should have rebuilt 2.5e12 particles.
+It rebuilt none. `limiting_substrate` already adds `cells_holding`, so it is
+not hiding inside membranes either.
+
+### The chemistry says it in one line
+
+```
+vent fuel (most energetic first):  HM, H2, H2S, HO3M, O2, H2NM
+vents.fuel_species = 2                    injected: HM, H2 only
+
+  82  O2 + HM    <=> HO2M       the only route that makes HO2M
+   8  O2 + CH2OS <=> CH2O3S     consumes O2
+  83  O2 + HOM   <=> HO3M       consumes O2, and the band-7 photon drives it this way
+```
+
+`rank_vent_fuel` takes the six most energetic molecules of six atoms or fewer,
+so that list is the whole list rather than a truncation. At `fuel_species = 2`
+the vents inject HM and H2, `Audit::elements_in` therefore only ever
+accumulates **H and M**, and HO2M is built from an element that does not enter
+this pond. Not slowly -- at no rate at all. No vent fuel on this seed contains
+carbon at any `fuel_species`, so the pond's entire carbon chemistry is a closed
+pool permanently.
+
+### Why `holding` endorsed it, which is the part to remember
+
+`holding` is sustained-over-opening, and it was put in specifically to catch a
+larder. It gave `CH2O2S` 0.003 and caught that one. It gave HO2M **1.231** --
+not merely holding its rate but *accelerating* -- and that reading is what the
+whole diet change was built on.
+
+A stock drained at a constant speed holds its rate perfectly across a window,
+because holding its rate is what a constant speed **is**. `holding` cannot
+distinguish a supply from a large pool being tapped harder, and over a 600 s
+window against a crash at 2000 s it never had a chance to. The column was not
+insufficiently sensitive. It was measuring the wrong thing confidently.
+
+### The provenance column
+
+Matter crosses this world's boundary in exactly two places -- `vent_matter`
+puts it in at `world.rs:324`, `harvest` takes it out at `world.rs:539` -- and
+both book into `Audit::elements_in`. So the vents' contribution to a probe
+window is recoverable exactly: what the ledger gained, plus what the probe took
+back out. `Harvest` now carries the compound's `formula` and that per-window
+inflow, and three readings come off it:
+
+* **`funded(w)`** -- the largest harvest the vents could have *paid for*,
+  particles/s. A probe exports matter, so a sustained harvest is bounded by the
+  rate the world gains the atoms it is made of, and only a vent brings an atom
+  in; a photon carries energy, not matter, and can rearrange an atom but cannot
+  deliver one. The bound is deliberately **generous**: it credits one compound
+  with every atom the vents delivered, as though nothing else in the pond
+  wanted any, and ignores standing stock entirely. A compound that still reads
+  zero under that accounting is not being resupplied.
+* **`provenance()`** -- that over `sustained`, capped at one.
+* **`starved()`** -- which element binds, so the verdict names it.
+
+`verdict` asks provenance *before* it looks at the shape of the curve, and
+`report_inflow` prints the world's matter budget before the table, because that
+budget decides most of the table in advance.
+
+On `renew.toml`, settle 150, probe 60:
+
+```
+inflow    the vents deliver H 3.600e10, M 1.200e10 -- atoms per second, off the audit's element ledger
+          nothing brings C, O, N, S into this pond, so a harvest of anything containing one of them is stock
+
+  compound       standing      opening    sustained       funded  holding
+  HOM             8.246e8   1.573e10/s   1.397e10/s    0.000e0/s    0.888  stock - no O enters this pond
+  H2             1.333e13   1.215e10/s   1.213e10/s   1.800e10/s    0.998  renewed
+  HM             4.621e11   1.208e10/s   1.205e10/s   1.200e10/s    0.998  renewed
+  HO2M           1.854e10    6.920e9/s    8.817e9/s    0.000e0/s    1.274  stock - no O enters this pond
+  CH2OS          4.123e10    4.630e9/s    5.276e9/s    0.000e0/s    1.139  stock - no C enters this pond
+  H2NM            2.254e7    1.824e5/s    1.570e5/s    0.000e0/s    0.861  stock - no N enters this pond
+```
+
+**Two of twenty-two candidates come back renewed, and they are the two the
+vents inject.** The inflow line is checkable by hand -- `vents = 3` at
+`fuel_rate = 4.0e9` gives H at 1.2e10 from HM plus 2.4e10 from H2, M at 1.2e10
+-- and `funded` follows from it arithmetically: HM at 1.200e10, H2 at 3.6e10/2
+= 1.800e10. The instrument now checks itself against the config's stated flux
+in a second column as well as the first.
+
+### The settle sweep, which confirmed it from the other side
+
+The same probe on the same lifeless config at `--settle 2200` instead of 150:
+
+| | settle 150 s | settle 2200 s | factor |
+| --- | --- | --- | --- |
+| HO2M standing | 1.854e10 | **1.037e4** | 1.8e6 |
+| HO2M sustained | 8.817e9/s | **4.543e4/s** | **1.94e5** |
+| O2 standing | 9.577e12 | 2.293e9 | 4.2e3 |
+| O2 sustained | 3.285e3/s | **0.000e0/s** | dead end |
+| `HO2M + HM` living | 4.718e-9 W, 47176 cells | **2.431e-14 W, 0 cells** | 1.94e5 |
+
+**The pond retires its own oxygen in 2200 s with nothing living in it.** The
+population was never needed to explain the crash; it only arrived in time to be
+blamed for it. The sustained rate and the sustainable power fall by the same
+1.94e5, from two independent columns.
+
+Two further things in that run:
+
+* **The reading was taken at the pond's most flattering instant, and not by
+  accident.** `supply` defaults `--settle` to `seed_delay`, which is exactly
+  when `choose_metabolism` picks the ancestors' diet. Both instruments read the
+  same transient at the same moment and neither could see it was one.
+* **At a late settle `holding` does not merely fail, it inverts.** `HO3M`
+  reports `holding 113230009667.186 -> renewed` on a standing stock of 3778
+  particles, because its opening window was 3.255e-7/s. `CH2O2S` reads
+  `renewed` at 27.8, `HO2M` at 5.075. Half that table says "renewed" about
+  compounds that are essentially gone.
+
+### The bug the first live run exposed, in the new arithmetic
+
+Three compounds came back with **negative** funded rates -- H2O at -1.595e-1/s
+-- and `-0%` in the vent-fed column. A negative "largest harvest the vents
+could pay for" is not a small number, it is a wrong one, and `O2` read
+`part stock - O inflow pays 0% of it` off 4.4e-4/s of the same noise.
+
+`elements_in` is differenced across a window at the magnitude of every atom of
+that element that has ever crossed the boundary -- once the standing stock is
+harvested, the pond's whole inventory, 1.152e15 for H2O's oxygen. An ulp there
+is 0.125, each tick books one, and a window has 1200 ticks. The residue was
+rounding. `vent_inflow` now applies a floor of `ticks * EPSILON * ledger
+magnitude` and reports below it as the zero it is;
+`ledger_rounding_is_not_reported_as_inflow` and
+`the_floor_does_not_swallow_a_real_inflow` are the pair that pin it, the second
+asserting a genuine 1.2e11 survives being measured against a 1e15 baseline.
+
+### What is deliberately *not* done
+
+The livings table gets a `vent-fed` column but **is not re-ranked on
+`funded`**. Bounding a living by matter inflow would be the mirror image of the
+error just caught: a *cell* exports nothing -- it turns its substrate into
+products and leaves every atom in the pond -- so a living can be sustained by
+matter that never enters at all, provided photochemistry drives the products
+back. On this chemistry there is such a route,
+`HOM --(band 7, +O2)--> HO3M --(+H2, rxn 30)--> HO2M`.
+
+So `funded` bounds the **probe**, which exports matter, and not a population,
+which does not. The table prints both and says which question each answers.
+Ranking honestly on a number that answers the wrong question beats ranking
+confidently on one bent to answer the right one.
+
+### What this costs the runs that came before
+
+Nothing in the cell layer is invalidated: `subsistence`, the lifecycle
+re-tuning, the 193 births after the peak all stand as measurements of what
+those cells did in that pond. What is invalidated is **the reason `renew.toml`
+gives for its own existence**. Its header quotes HO2M at 8.512e9/s and
+`holding 1.231` as the renewable living the pond had all along, and that is a
+transient read at t = 150 in a pond whose oxygen chemistry is still on its way
+down. The 17333-cell boom was a larger larder, not a supply.
+
+### Threads are free, and the machine was being wasted
+
+Small worlds do not want all 22 threads and the performance section already
+said so, but three jobs at a default rayon pool each is worse than that: it is
+22 threads three times over. `verify --ticks 500` at 1, 4, 8 and 22 threads
+gives digest `84f89bb98d14f9d4` every time, with identical drift -- so
+`RAYON_NUM_THREADS=8` per job, several jobs side by side, costs nothing and is
+about 2.5x the total throughput.
+
+
 ## What is left
 
 ### Immediately outstanding
@@ -1798,29 +1977,63 @@ of `renew.toml` is the next thing, and it is running.
    `division_reserve` sweep, and what it closed". Nothing in `CellConfig` was
    ever going to fix this.
 1. **Give the population a renewable living.** Still the one that matters, and
-   it has moved from a diagnosis to a measurement and then to a run.
-   * `hadean supply` is the instrument that was asked for -- a rate, not an
-     amount -- and it agrees with the vents' known flux to within 0.5%. On seed
-     1 the ancestor's food is resupplied at 1.03e7 particles/s against a
-     standing stock of 1.15e13, and `HO2M + HM <=> 2 HOM` is resupplied at
-     8.5e9/s and sustains 4.554e-9 W, or 455 cells. The pond had a renewable
-     living in it the whole time and `choose_metabolism` was ranking on the
-     column that hides it.
-   * `configs/renew.toml` eats it. On the carried-over lifecycle numbers the
-     cohort starves, because a pond-wide rate is not a per-cell one; on numbers
-     re-measured against the diet it booms to 17333 and records **193 births
-     after the peak**, where every previous run in this project recorded zero
-     or three. **The recovery has still not been shown**, and the reason is a
-     run length rather than a mechanism: the peak lands at tick 187000 against
-     the larder's 26000, and both 250000-tick runs were still crashing when the
-     clock stopped. An 800000-tick run is the next thing and it is the first
-     item to check.
-   * The second route in this item is untried and is now much more attractive:
-     raise `vents.fuel_species` past 2 so O2 and H2S reach the water. On seeds
-     2, 3 and 5 that makes the ancestor's whole diet vent-fed, and `supply` can
-     say by how much before a run is spent on it. Every previous attempt at
-     this was flown blind.
-1b. **`renew.toml` is not the finished preset and should not be treated as
+   the answer it has been given twice is now known to be wrong twice.
+   * `hadean supply` measures a rate rather than an amount, and it agrees with
+     the vents' known flux to within 0.5%. That much stands. What it does not
+     do on its own is tell a rate from a stock being drained at a steady speed,
+     because `holding` cannot: it gave HO2M **1.231**, accelerating, on a
+     compound built from an element that does not enter this pond. See "The
+     larder that held its rate".
+   * **The `funded` column is in.** Provenance off the audit's element ledger,
+     which is horizon-independent in the way a longer window never could be.
+     On `renew.toml` two of twenty-two candidates come back renewed and they
+     are the two the vents inject.
+   * **`configs/renew.toml`'s justification is void, though its numbers are
+     not.** The 17333-cell boom and the 193 births after the peak happened; the
+     diet they happened on is a larger larder, not a supply. Do not treat that
+     header comment as a measurement to build on. The lifecycle numbers in it
+     were honestly re-measured *against that diet* and will have to be
+     re-measured again against whatever replaces it -- see item 2, which has
+     now been right three times.
+   * **The second route is no longer speculative and is the thing to try
+     next.** O2 is *fifth* in this seed's vent fuel list, so at
+     `fuel_species = 5` the vents inject it, `O2 + HM -> HO2M` has both
+     reactants vent-fed, and `HO2M + HM -> 2 HOM` becomes a living paid for
+     from outside the pond. One line in the config. Run `supply` on it first
+     and read the `funded` column: it now answers this before a run is spent.
+     `runs/vent2.log` and `vent5.log` are **not** a test of this -- they are
+     seed 5 on the old lifecycle numbers, where the pre-run check already said
+     only the far tail could fund a daughter.
+   * Carbon never has an inflow on this seed at any `fuel_species`, so no
+     carbon-based living is sustainable in this pond however the vents are set.
+     That is a fact about seed 1's chemistry and worth checking on others
+     before a seed is chosen to build on.
+1b. **A settle-time sweep in `supply` is the next instrument, ahead of the
+   return-leg probe.** `--settle` defaults to `seed_delay`, so the probe reads
+   the pond at the same instant `choose_metabolism` does, and on `renew.toml`
+   that instant is a transient: at `--settle 2200` the same lifeless pond
+   reports HO2M's sustained rate down by 1.94e5 and O2 as a dead end. Reporting
+   each rate at two or three settle times would have caught this without the
+   element ledger at all. It is cheap once the settle is cached, because the
+   long settle passes through the short one.
+1c. **`--settle-out` / `--settle-in`.** The settle is 84% of a probe's cost --
+   1281 s of the 1531 s `--settle 2200` run -- and `supply` already builds the
+   settled snapshot in memory before dropping it at exit. This is what makes
+   1b affordable and makes re-probing a config free.
+1d. **The return-leg probe.** `supply` asks how fast the pond replaces a
+   compound *removed from the world*, and no organism ever asks that. A cell
+   turns its substrate into products and leaves every atom in the pond, so what
+   bounds a population is whether photochemistry can drive the products back --
+   here `HOM --(band 7, +O2)--> HO3M --(+H2, rxn 30)--> HO2M`. Same probe
+   machinery, different perturbation: apply the metabolic reaction forward and
+   measure the return. Until this exists, no number in this project bounds a
+   population's food supply; `funded` bounds the probe and says so in its own
+   output.
+1e. **`supply` has been run on one config.** It should be run on `pond.toml` at
+   full depth, on the other seeds, and at `fuel_species` above 2, before any of
+   those is tuned by hand. Cheap next to the runs it replaces, and cheaper
+   again after 1c.
+1f. **`renew.toml` is not the finished preset and should not be treated as
    one.** `membrane_scale` and `metabolic_rate` are set where the sweeps showed
    them to be inert, which is a floor and not a measurement, and
    `maintenance_power` and `division_reserve` were scaled by the two orders the
@@ -1828,10 +2041,15 @@ of `renew.toml` is the next thing, and it is running.
    in the file. `population_cap` is the thing to watch: `renewC` was heading
    for five figures within two hundred seconds, and a run that touches the cap
    proves nothing by construction.
-1c. **`supply` has been run on one config.** It costs a settled world per
-   candidate substrate and it should be run on `pond.toml` at full depth, on
-   the other seeds, and at `fuel_species` above 2, before any of those is tuned
-   by hand. It is cheap next to the runs it replaces.
+1g. The 800000-tick `renew.toml` run was started and **killed at tick 180000**,
+   deliberately, once the element ledger made its ending known: it was tracking
+   `renewA` exactly and `renewA` ends with the food's oxygen gone. There is no
+   longer a reason to run it. `runs/renew-long-killed.log` is the earlier
+   attempt that died on its own at tick 300000, and it is the record of the
+   pond going 100% dormant and continuing to fall. The 3000 s single-compound
+   probe was also started and killed before it printed, so the "probe for
+   longer" arm is untested -- the settle sweep answered the same question
+   better.
 2. The lifecycle numbers were tuned against seed 1's food chain. If the food
    chain changes, `division_reserve`, `membrane_scale` and `maximum_age` all
    have to be re-measured against it. Do not carry them over on trust; the

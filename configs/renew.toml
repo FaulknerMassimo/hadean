@@ -1,4 +1,26 @@
-# The gate pond, on the living it actually has.
+# The gate pond, on the living it actually has -- except that it does not.
+#
+# READ THIS FIRST. Everything below the line is the reasoning that produced
+# this file and it is kept because the lifecycle numbers in it were honestly
+# measured. The *diet* it argues for is wrong. `HO2M + HM` was chosen off a
+# `holding` of 1.231, and a stock drained at a constant speed holds its rate
+# perfectly -- holding its rate is what a constant speed is. HO2M is built from
+# oxygen and `fuel_species = 2` puts no oxygen into this pond at any rate:
+#
+#     hadean supply --config configs/renew.toml --probe 60
+#     HO2M   1.854e10   6.920e9/s   8.817e9/s   0.000e0/s   1.274  stock - no O enters this pond
+#                                              ^^^^^^^^^^ funded
+#
+# Probed at --settle 2200 instead of the default 150, the same lifeless pond
+# reports HO2M's resupply down by a factor of 1.94e5 and O2 as a dead end: this
+# world retires its own oxygen with nothing living in it. The 17333-cell boom
+# below is real and it happened on a larger larder.
+#
+# `vents.fuel_species = 5` puts O2 in the water and is the thing to try. See
+# HANDOFF.md, "The larder that held its rate".
+#
+# ---
+#
 #
 # Physically this is `gate.toml` -- same seed, same chemistry, same sun, same
 # vents, same grid, same lifecycle numbers. One line differs, and it is the

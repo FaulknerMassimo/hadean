@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use hadean_analysis::population::{population_curve, PopulationCurve, Thresholds};
 use hadean_analysis::{analyse, chart, Series};
 use hadean_chem::chemistry::Drive;
+use hadean_chem::element::{self, N_ELEMENTS};
 use hadean_chem::generate::kj;
 use hadean_sim::{snapshot, World, WorldConfig};
 
@@ -721,6 +722,14 @@ struct Harvest {
     standing: f64,
     /// Particles the chemistry rebuilt in each window, in order.
     windows: [f64; SUPPLY_WINDOWS],
+    /// Atoms of each element the vents delivered during each window. Matter
+    /// crosses this world's boundary in exactly two places -- `vent_matter`
+    /// puts it in, `harvest` takes it out -- and both book into
+    /// `Audit::elements_in`, so this is read back off the ledger rather than
+    /// taken on trust from the config's stated flux.
+    vents: [[f64; N_ELEMENTS]; SUPPLY_WINDOWS],
+    /// Atoms per particle of the compound being probed.
+    formula: [u16; N_ELEMENTS],
     /// Seconds of world time the whole probe covered.
     seconds: f64,
 }
@@ -750,6 +759,59 @@ impl Harvest {
         } else {
             0.0
         }
+    }
+
+    fn window_seconds(&self) -> f64 {
+        self.seconds / SUPPLY_WINDOWS as f64
+    }
+
+    /// The largest harvest the vents could have *paid for* in window `w`,
+    /// particles per second.
+    ///
+    /// A probe exports matter: what it takes out of the pond never comes back.
+    /// So a sustained harvest is bounded by the rate at which the world gains
+    /// the atoms the compound is made of, and the only thing that brings atoms
+    /// in is a vent -- a photon carries energy, not matter, and can rearrange
+    /// an atom but cannot deliver one.
+    ///
+    /// The bound is deliberately generous. It credits this one compound with
+    /// *every* atom the vents delivered, as though nothing else in the pond
+    /// wanted any of them, and it ignores the standing stock entirely. A
+    /// compound that still reads zero under that accounting is not being
+    /// resupplied at all, and no length of window will change it.
+    fn funded(&self, w: usize) -> f64 {
+        let seconds = self.window_seconds();
+        (0..N_ELEMENTS)
+            .filter(|&e| self.formula[e] > 0)
+            .map(|e| self.vents[w][e] / seconds / self.formula[e] as f64)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// What fraction of the sustained harvest the world's inflow can pay for.
+    ///
+    /// One means every particle handed over was matched by the matter to build
+    /// another one. Zero means the whole measured rate was the pond being
+    /// emptied at a steady speed -- which is the case `holding` cannot see,
+    /// because a steady speed holds its rate across a window by definition.
+    fn provenance(&self) -> f64 {
+        let sustained = self.sustained();
+        if sustained > 0.0 {
+            (self.funded(SUPPLY_WINDOWS - 1) / sustained).min(1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// The element whose inflow binds the harvest: the one the pond runs short
+    /// of first, and the specific thing that is missing when a resupply is
+    /// really a stock.
+    fn starved(&self) -> Option<u8> {
+        let seconds = self.window_seconds();
+        let per = |e: usize| self.vents[SUPPLY_WINDOWS - 1][e] / seconds / self.formula[e] as f64;
+        (0..N_ELEMENTS)
+            .filter(|&e| self.formula[e] > 0)
+            .min_by(|&a, &b| per(a).partial_cmp(&per(b)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|e| e as u8)
     }
 }
 
@@ -826,11 +888,13 @@ in {SUPPLY_WINDOWS} windows"
     }
     let base = snapshot::save(&world)?;
     println!(
-        "settled   {} ticks, {:.1} s wall, snapshot {} KiB\n",
+        "settled   {} ticks, {:.1} s wall, snapshot {} KiB",
         settle_ticks,
         began.elapsed().as_secs_f64(),
         base.len() / 1024
     );
+    report_inflow(&world, settle);
+    println!();
 
     let window_ticks = ((probe / dt).round() as u64 / SUPPLY_WINDOWS as u64).max(1);
     let seconds = (window_ticks * SUPPLY_WINDOWS as u64) as f64 * dt;
@@ -845,18 +909,30 @@ in {SUPPLY_WINDOWS} windows"
                 // Each probe is its own world, restored from the same settled
                 // state, so nothing about the result depends on `--jobs`.
                 let mut w = snapshot::load(&base)?;
+                let formula = w.chem.compound(compound).formula;
                 let standing = w.harvest(compound);
                 let mut windows = [0.0f64; SUPPLY_WINDOWS];
-                for window in windows.iter_mut() {
+                let mut vents = [[0.0f64; N_ELEMENTS]; SUPPLY_WINDOWS];
+                for (window, vented) in windows.iter_mut().zip(vents.iter_mut()) {
+                    let before = w.audit.elements_in;
                     for _ in 0..window_ticks {
                         w.step();
                         *window += w.harvest(compound);
                     }
+                    *vented = vent_inflow(
+                        &w.audit.elements_in,
+                        &before,
+                        *window,
+                        &formula,
+                        window_ticks,
+                    );
                 }
                 Ok(Harvest {
                     compound,
                     standing,
                     windows,
+                    vents,
+                    formula,
                     seconds,
                 })
             })
@@ -871,16 +947,17 @@ in {SUPPLY_WINDOWS} windows"
 
     println!("resupply, particles per second, holding each compound at zero");
     println!(
-        "  {:<10} {:>12}  {:>11}  {:>11}  {:>7}  {}",
-        "compound", "standing", "opening", "sustained", "holding", ""
+        "  {:<10} {:>12}  {:>11}  {:>11}  {:>11}  {:>7}  {}",
+        "compound", "standing", "opening", "sustained", "funded", "holding", ""
     );
     for h in &harvests {
         println!(
-            "  {:<10} {:>12.3e}  {:>9.3e}/s  {:>9.3e}/s  {:>7.3}  {}",
+            "  {:<10} {:>12.3e}  {:>9.3e}/s  {:>9.3e}/s  {:>9.3e}/s  {:>7.3}  {}",
             world.chem.compound(h.compound).name,
             h.standing,
             h.opening(),
             h.sustained(),
+            h.funded(SUPPLY_WINDOWS - 1),
             h.holding(),
             verdict(h),
         );
@@ -890,6 +967,19 @@ in {SUPPLY_WINDOWS} windows"
         let mut v = vec![0.0; world.chem.n_compounds()];
         for h in &harvests {
             v[h.compound as usize] = h.sustained();
+        }
+        v
+    };
+    // Kept beside the rate rather than folded into it. Bounding the livings
+    // below by the vents' inflow would be wrong in the opposite direction to
+    // the error this column exists to catch: a *cell* exports nothing, so a
+    // living can be sustained by matter that never enters the pond at all, as
+    // long as photochemistry keeps driving the products back. The honest thing
+    // is to rank on what was measured and say how much of it was stock.
+    let paid: Vec<f64> = {
+        let mut v = vec![0.0; world.chem.n_compounds()];
+        for h in &harvests {
+            v[h.compound as usize] = h.provenance();
         }
         v
     };
@@ -916,7 +1006,7 @@ its scarcest.\nrun without it to rank what this pond can feed."
     }
 
     let settled = world.abundance();
-    let mut livings: Vec<(f64, f64, f64, u32)> = world
+    let mut livings: Vec<(f64, f64, f64, u32, f64)> = world
         .chem
         .reactions
         .iter()
@@ -931,7 +1021,14 @@ its scarcest.\nrun without it to rank what this pond can feed."
                 let power = turnovers * -r.dh * cells.capture_efficiency as f64;
                 let reach =
                     hadean_cell::subsistence(&cells, &world.chem, r.id, &settled, &world.grid);
-                (power, power / cells.maintenance_power, reach, r.id)
+                // A living is no better funded than its worst-funded substrate,
+                // the same way it is no faster than its scarcest.
+                let fed = r
+                    .reactants
+                    .iter()
+                    .map(|&(c, _)| paid[c as usize])
+                    .fold(f64::INFINITY, f64::min);
+                (power, power / cells.maintenance_power, reach, r.id, fed)
             })
         })
         .collect();
@@ -951,18 +1048,19 @@ maintenance_power {:.2e} W",
     // The first column being large tells you nothing if the last one is below
     // one -- which on this chemistry is exactly the case that cost eight runs.
     println!(
-        "  {:>11}  {:>11}  {:>10}  {}",
-        "sustains", "population", "per newborn", "reaction"
+        "  {:>11}  {:>11}  {:>10}  {:>8}  {}",
+        "sustains", "population", "per newborn", "vent-fed", "reaction"
     );
     if livings.is_empty() {
         println!("  none: no exergonic thermal reaction has all of its substrates resupplied");
     }
-    for &(power, capacity, reach, id) in livings.iter().take(10) {
+    for &(power, capacity, reach, id, fed) in livings.iter().take(10) {
         println!(
-            "  {:>9.3e} W  {:>7.0} cells  {:>8.3}x  {}",
+            "  {:>9.3e} W  {:>7.0} cells  {:>8.3}x  {:>7.0}%  {}",
             power,
             capacity,
             reach,
+            fed * 100.0,
             equation(&world.chem, id)
         );
     }
@@ -970,7 +1068,7 @@ maintenance_power {:.2e} W",
     println!();
     let reachable = livings.iter().find(|l| l.2 >= 1.0);
     match (livings.first(), reachable) {
-        (Some(&(power, capacity, reach, id)), _) if reach >= 1.0 => {
+        (Some(&(power, capacity, reach, id, _)), _) if reach >= 1.0 => {
             println!(
                 "the best living here is {} at {:.3e} W, which keeps {:.0} cells alive, \
 and a newborn earns {:.2}x its upkeep on it",
@@ -980,7 +1078,7 @@ and a newborn earns {:.2}x its upkeep on it",
                 reach
             );
         }
-        (Some(&(power, capacity, reach, id)), best) => {
+        (Some(&(power, capacity, reach, id, _)), best) => {
             println!(
                 "the best living here is {} at {:.3e} W and {:.0} cells -- but a newborn \
 earns only {:.3}x its upkeep on it,",
@@ -994,7 +1092,7 @@ earns only {:.3}x its upkeep on it,",
 cell-layer problem, not a chemistry one."
             );
             match best {
-                Some(&(p, c, reach, id)) => println!(
+                Some(&(p, c, reach, id, _)) => println!(
                     "the best living a newborn *can* pay its way on is {} at {:.3e} W \
 and {:.0} cells ({:.2}x upkeep)",
                     equation(&world.chem, id),
@@ -1010,23 +1108,137 @@ the water holds"
         }
         (None, _) => println!("this pond has no renewable living in it at all"),
     }
+
+    // The line that stops this table being read as more than it is. The
+    // vent-fed column can be zero across the board and the pond still feed a
+    // population, because the two things are answers to different questions.
+    if let Some(&(_, _, _, id, fed)) = livings.first() {
+        if fed < 0.5 {
+            println!();
+            println!(
+                "read that against the vent-fed column: only {:.0}% of the rate measured \
+for {} was paid for by matter entering the pond, and the rest came out of standing stock.",
+                fed * 100.0,
+                equation(&world.chem, id)
+            );
+            println!(
+                "that is a bound on the *probe*, which exports matter, and not on a population, \
+which does not -- a cell turns its substrate into products and leaves every atom"
+            );
+            println!(
+                "in the pond. What decides a population is whether the photochemistry can drive \
+those products back to the substrate, and this command does not measure that."
+            );
+        }
+    }
     println!("\n{:.1} s wall", began.elapsed().as_secs_f64());
     Ok(())
 }
 
+/// What the vents put into the pond during one window, element by element.
+///
+/// `Audit::elements_in` nets both boundary crossings -- `vent_matter` adds and
+/// `harvest` subtracts -- so the vents' share is what the ledger gained plus
+/// what the probe took back out.
+///
+/// The subtraction is done at the magnitude of every atom of that element that
+/// has ever crossed the boundary, which once the standing stock has been
+/// harvested is the size of the pond's whole inventory of it. Each tick's
+/// booking rounds at an ulp of *that*, and a window carries up to `ticks` of
+/// them. So a reading below that floor is not a small inflow, it is the
+/// arithmetic's own noise, and it is reported as the zero it is: measured
+/// against a pond holding 1.15e15 atoms of oxygen, the residue came out at
+/// -1.6e-1 atoms a second, and "no oxygen enters this pond" and "oxygen enters
+/// this pond at minus a sixth of an atom a second" are the same fact with only
+/// one of them readable as one.
+fn vent_inflow(
+    after: &[f64; N_ELEMENTS],
+    before: &[f64; N_ELEMENTS],
+    harvested: f64,
+    formula: &[u16; N_ELEMENTS],
+    ticks: u64,
+) -> [f64; N_ELEMENTS] {
+    let mut out = [0.0; N_ELEMENTS];
+    for e in 0..N_ELEMENTS {
+        let raw = after[e] - before[e] + harvested * formula[e] as f64;
+        let floor = ticks as f64 * f64::EPSILON * after[e].abs().max(before[e].abs());
+        out[e] = if raw > floor { raw } else { 0.0 };
+    }
+    out
+}
+
+/// What the vents actually deliver, element by element.
+///
+/// Every atom in this pond either started here or came out of a vent, and a
+/// settled lifeless world has had nothing else happen to it, so the audit's
+/// element ledger over the settle *is* the world's matter budget. It is
+/// printed before the table because it decides most of the table in advance:
+/// a harvest of a compound built from an element with no inflow is a stock
+/// being emptied, however flat its curve looks over a window.
+fn report_inflow(world: &World, settle: f64) {
+    if settle <= 0.0 {
+        return;
+    }
+    let symbol = |e: usize| element::element(e as u8).symbol;
+    let fed: Vec<String> = (0..N_ELEMENTS)
+        .filter(|&e| world.audit.elements_in[e] > 0.0)
+        .map(|e| format!("{} {:.3e}", symbol(e), world.audit.elements_in[e] / settle))
+        .collect();
+    let dry: Vec<&str> = (0..N_ELEMENTS)
+        .filter(|&e| world.audit.elements_in[e] <= 0.0)
+        .map(symbol)
+        .collect();
+    if fed.is_empty() {
+        println!("inflow    the vents deliver no matter at all: every harvest below is stock");
+        return;
+    }
+    println!(
+        "inflow    the vents deliver {} -- atoms per second, off the audit's element ledger",
+        fed.join(", ")
+    );
+    if !dry.is_empty() {
+        println!(
+            "          nothing brings {} into this pond, so a harvest of anything containing \
+one of them is stock",
+            dry.join(", ")
+        );
+    }
+}
+
 /// A word for what a probe found, so the table can be read without doing
 /// arithmetic in your head.
-fn verdict(h: &Harvest) -> &'static str {
+fn verdict(h: &Harvest) -> String {
     if h.sustained() <= 0.0 {
-        "dead end - nothing comes back"
-    } else if h.holding() >= 0.5 {
-        "renewed"
+        return "dead end - nothing comes back".to_string();
+    }
+    // Provenance is asked before the shape of the curve, because it outranks
+    // it. A stock drained at a steady speed holds its rate perfectly across a
+    // window -- holding its rate is what a steady speed *is* -- so `holding`
+    // near one is exactly as consistent with a larder as with a supply, and on
+    // this chemistry it endorsed one at 1.231. The element ledger is not a
+    // matter of how long the window was.
+    let starved = h.starved().map(|e| element::element(e).symbol);
+    if h.funded(SUPPLY_WINDOWS - 1) <= 0.0 {
+        return match starved {
+            Some(e) => format!("stock - no {e} enters this pond"),
+            None => "stock - nothing enters this pond".to_string(),
+        };
+    }
+    let paid = h.provenance();
+    if paid < 0.5 {
+        return match starved {
+            Some(e) => format!("part stock - {e} inflow pays {:.0}% of it", paid * 100.0),
+            None => format!("part stock - inflow pays {:.0}% of it", paid * 100.0),
+        };
+    }
+    if h.holding() >= 0.5 {
+        "renewed".to_string()
     } else if h.holding() >= 0.05 {
-        "draining"
+        "draining".to_string()
     } else if h.standing / h.sustained() > 1.0e5 {
-        "larder - a big stock on a trickle"
+        "larder - a big stock on a trickle".to_string()
     } else {
-        "draining"
+        "draining".to_string()
     }
 }
 
@@ -1419,4 +1631,165 @@ fn bench(config: Option<PathBuf>, ticks: u64) -> anyhow::Result<()> {
         world.config.dt / per_tick
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hadean_chem::element::{H, M, O};
+
+    /// A probe result with the numbers set by hand, so the arithmetic can be
+    /// checked without settling a world.
+    fn probe(
+        formula: [u16; N_ELEMENTS],
+        per_window: f64,
+        vent: [f64; N_ELEMENTS],
+    ) -> Harvest {
+        Harvest {
+            compound: 0,
+            standing: 0.0,
+            windows: [per_window; SUPPLY_WINDOWS],
+            vents: [vent; SUPPLY_WINDOWS],
+            formula,
+            // One second per window, so a window's particles are its rate.
+            seconds: SUPPLY_WINDOWS as f64,
+        }
+    }
+
+    /// HO2M, in a pond whose vents inject HM and H2 -- which is `renew.toml`.
+    fn ho2m(vent: [f64; N_ELEMENTS]) -> Harvest {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 1;
+        formula[O as usize] = 2;
+        formula[M as usize] = 1;
+        probe(formula, 100.0, vent)
+    }
+
+    fn vents(h: f64, o: f64, m: f64) -> [f64; N_ELEMENTS] {
+        let mut v = [0.0; N_ELEMENTS];
+        v[H as usize] = h;
+        v[O as usize] = o;
+        v[M as usize] = m;
+        v
+    }
+
+    #[test]
+    fn an_element_with_no_inflow_funds_nothing() {
+        let h = ho2m(vents(1.0e3, 0.0, 1.0e3));
+        assert_eq!(h.sustained(), 100.0);
+        assert_eq!(h.funded(SUPPLY_WINDOWS - 1), 0.0);
+        assert_eq!(h.provenance(), 0.0);
+        assert_eq!(h.starved(), Some(O));
+    }
+
+    /// The bug this column was built for. A stock drained at a constant speed
+    /// holds its rate across every window, so `holding` reads a perfect 1.0 --
+    /// which is what endorsed HO2M at 8.512e9/s on a pond with no oxygen
+    /// coming into it. Provenance is the reading that does not care how long
+    /// the window was.
+    #[test]
+    fn a_steady_drain_holds_its_rate_and_is_still_a_stock() {
+        let h = ho2m(vents(1.0e3, 0.0, 1.0e3));
+        assert_eq!(h.holding(), 1.0);
+        assert!(verdict(&h).starts_with("stock - no O"));
+    }
+
+    /// The bound is generous on purpose: every atom the vents delivered is
+    /// credited to this one compound, as though nothing else wanted any.
+    #[test]
+    fn funded_credits_the_whole_inflow_to_one_compound() {
+        // 100 particles/s of HO2M needs 200 O atoms/s. Half that inflow funds
+        // half the harvest, and no more, whatever the other elements do.
+        let h = ho2m(vents(1.0e9, 100.0, 1.0e9));
+        assert_eq!(h.funded(SUPPLY_WINDOWS - 1), 50.0);
+        assert_eq!(h.provenance(), 0.5);
+        assert_eq!(h.starved(), Some(O));
+    }
+
+    #[test]
+    fn a_vent_fed_compound_is_fully_funded() {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 1;
+        formula[M as usize] = 1;
+        let h = probe(formula, 100.0, vents(100.0, 0.0, 100.0));
+        assert_eq!(h.funded(SUPPLY_WINDOWS - 1), 100.0);
+        assert_eq!(h.provenance(), 1.0);
+        assert_eq!(verdict(&h), "renewed");
+    }
+
+    /// The vents put in 1.2e10 H and 1.2e10 M a second and no oxygen at all;
+    /// the probe took 100 particles of HO2M back out. The ledger has to hand
+    /// back exactly that, with the oxygen at zero.
+    #[test]
+    fn vent_inflow_reads_the_ledger_back() {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 1;
+        formula[O as usize] = 2;
+        formula[M as usize] = 1;
+        let before = [0.0; N_ELEMENTS];
+        let mut after = [0.0; N_ELEMENTS];
+        after[H as usize] = 1.2e10 - 100.0;
+        after[O as usize] = -200.0;
+        after[M as usize] = 1.2e10 - 100.0;
+        let v = vent_inflow(&after, &before, 100.0, &formula, 1200);
+        assert_eq!(v[H as usize], 1.2e10);
+        assert_eq!(v[O as usize], 0.0);
+        assert_eq!(v[M as usize], 1.2e10);
+    }
+
+    /// The defect the first live run exposed. Differencing the ledger across a
+    /// window happens at the magnitude of the pond's whole inventory, so an
+    /// element with no inflow lands a fraction of an atom either side of zero
+    /// -- and a negative "largest harvest the vents could pay for" is not a
+    /// small number, it is a wrong one. Below the floor the answer is zero.
+    #[test]
+    fn ledger_rounding_is_not_reported_as_inflow() {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 2;
+        formula[O as usize] = 1;
+        // A pond holding 1.15e15 oxygen atoms, all of it already harvested, so
+        // the window's delta is differenced against that magnitude.
+        let harvested = 5.0e5;
+        let mut before = [0.0; N_ELEMENTS];
+        before[O as usize] = -1.152e15;
+        before[H as usize] = -2.304e15;
+        let mut after = before;
+        // What the books would say if the arithmetic were exact, off by the
+        // ulp the run actually produced.
+        after[O as usize] -= harvested;
+        after[H as usize] -= 2.0 * harvested;
+        after[O as usize] -= 0.1595;
+        let v = vent_inflow(&after, &before, harvested, &formula, 1200);
+        assert_eq!(v[O as usize], 0.0, "rounding must not read as inflow");
+        assert_eq!(v[H as usize], 0.0);
+    }
+
+    /// And the floor must not swallow a real one: three vents at 4e9/s is the
+    /// figure `renew.toml` states, and it has to survive being measured.
+    #[test]
+    fn the_floor_does_not_swallow_a_real_inflow() {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 1;
+        formula[M as usize] = 1;
+        let mut before = [0.0; N_ELEMENTS];
+        before[H as usize] = 1.0e15;
+        before[M as usize] = 1.0e15;
+        let mut after = before;
+        after[H as usize] += 1.2e11;
+        after[M as usize] += 1.2e11;
+        let v = vent_inflow(&after, &before, 0.0, &formula, 1200);
+        assert_eq!(v[H as usize], 1.2e11);
+        assert_eq!(v[M as usize], 1.2e11);
+    }
+
+    /// Provenance is a fraction of what was measured, so a pond delivering
+    /// more than the probe took does not report more than all of it.
+    #[test]
+    fn provenance_does_not_exceed_one() {
+        let mut formula = [0u16; N_ELEMENTS];
+        formula[H as usize] = 1;
+        formula[M as usize] = 1;
+        let h = probe(formula, 100.0, vents(1.0e6, 0.0, 1.0e6));
+        assert_eq!(h.provenance(), 1.0);
+    }
 }
