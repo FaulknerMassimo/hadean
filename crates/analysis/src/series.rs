@@ -54,6 +54,19 @@ pub struct Row {
     /// a run that ends anywhere else has selected, and the direction says what
     /// the pond rewarded.
     pub mean_uptake: f64,
+    /// Mean decoded genes per living cell. Zero without genomes.
+    pub mean_genes: f64,
+    /// Mean genome length in bytes, junk included.
+    pub mean_genome_bytes: f64,
+    /// Distinct genome allocations among the living -- clone lines.
+    pub distinct_genomes: u64,
+    /// Distinct reactions the living population catalyses.
+    ///
+    /// One for a pre-genome population, always, because one reaction is all
+    /// any of them can run. A second appearing partway through a genome run is
+    /// a lineage that found a different living, and that is the column this
+    /// whole layer exists to make it possible to write.
+    pub diet_breadth: u64,
     /// Standard deviation of that trait.
     ///
     /// Recorded beside the mean because the mean alone cannot tell a
@@ -68,7 +81,7 @@ impl Row {
 drift_j,relative_drift,mass_drift,light_in_j,radiated_out_j,vent_heat_in_j,\
 mean_temperature_k,surface_temperature_k,floor_temperature_k,surface_light_w_m2,\
 population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles,\
-mean_uptake,uptake_spread";
+mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_breadth";
 
     /// Take a reading from a world and its latest audit.
     pub fn sample(world: &World, report: &AuditReport) -> Self {
@@ -101,12 +114,16 @@ mean_uptake,uptake_spread";
             substrate: world.limiting_substrate(),
             mean_uptake: traits.mean_uptake,
             uptake_spread: traits.uptake_spread,
+            mean_genes: traits.mean_genes,
+            mean_genome_bytes: traits.mean_genome_bytes,
+            distinct_genomes: traits.distinct_genomes as u64,
+            diet_breadth: world.cells.diet().len() as u64,
         }
     }
 
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6}",
+            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6},{:.3},{:.1},{},{}",
             self.tick,
             self.elapsed,
             self.chemical,
@@ -132,6 +149,10 @@ mean_uptake,uptake_spread";
             self.substrate,
             self.mean_uptake,
             self.uptake_spread,
+            self.mean_genes,
+            self.mean_genome_bytes,
+            self.distinct_genomes,
+            self.diet_breadth,
         )
     }
 }

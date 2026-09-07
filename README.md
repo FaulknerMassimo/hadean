@@ -14,12 +14,13 @@ cell's lifecycle.
 - L0 substrate: units, counter-based randomness, fixed time, state hashing
 - L1 chemistry: atom graphs, generated reversible reactions, catalysis
 - L2 fields: conservative diffusion/advection, heat, light, static flow
-- L4 protocell (pre-genome): membrane transport, metabolism, maintenance,
-  Brownian motion, division, dormancy, individual lifespans, death,
-  decomposition
-- Heritable traits: cells differ in how much membrane they carry, daughters
-  inherit their mother's with a mutational kick, and the pond selects — the
-  first evolution in the project
+- L3 genome: a linear byte string that decodes into proteins — enzymes that
+  decide what a cell eats, transporters that decide what it can take up,
+  structural protein that decides what it can endure, and regulators that
+  decide how much of each it makes. Duplication, indels, inversion and
+  whole-genome duplication act on it at every division
+- L4 protocell: membrane transport, metabolism, maintenance, Brownian motion,
+  division, dormancy, individual lifespans, death, decomposition
 - Headless CLI, compressed snapshots, replay verification, CSV telemetry
 - Population-curve analysis: boom, bust and recovery read out of a run rather
   than asserted
@@ -27,7 +28,7 @@ cell's lifecycle.
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
 place and the energetics are sized against the pond's measured photochemical
-output. **The gate is not met**, and the reason has moved twice.
+output. **The gate is not met**, and the reason has moved three times.
 
 It was thought to be a famine, and it was ageing: every cell died at exactly
 the same age, so the cohort that boomed together aged out together. Individual
@@ -50,8 +51,37 @@ excretes has no way back: it is **mining a finite pool**. A boom, a bust and a
 recovery need a renewable resource, and this world does not have one for this
 metabolism. HANDOFF.md has the measurements and what to do about it.
 
-After Phase 2 comes the L3 genome, which replaces the protocell's hardcoded
-traits with a real one.
+So the genome arrived early, out of order, because the diagnosis pointed at it.
+The pre-genome cell has one heritable number and *every cell in the pond
+catalyses the same reaction*, chosen once and fixed for the run — which is the
+mechanism underneath the mining. A population that can only ever eat one thing
+cannot respond to that thing running out. With a genome, what a cell eats is an
+enzyme, an enzyme is eight bytes matched against the reaction network, and
+daughters differ from their mothers.
+
+The pond has a way out and does not use it: `O2 + CH2OS -> CH2O3S` is downhill
+and has a rate constant of 8e-15, which is no route at all. Lowering a barrier
+is precisely and only what an enzyme does, so a lineage that evolves onto that
+reaction is a decomposer, and a pond with a decomposer in it recycles its
+carbon instead of retiring it. That is the mechanism.
+
+**No run has found it, and the runs so far cannot.** A genome adapts across
+generations, and on seed 1 the population only ever gets one: it booms into the
+larder, and then either no cell at the margin can afford a daughter or the
+whole plateau is shut down dormant, depending on which way `division_reserve`
+is turned. Both ends give a single generation, because births balancing deaths
+is what a carrying capacity is and this pond has none. The genome is not
+blocked by anything in the genome; it is queued behind the renewable living
+that was already the outstanding problem. What the runs do show is that the
+machinery works under load — 617 lineages against a clone control's 1, standing
+variation of 0.357 against exactly 0.000, and an energy audit flat to 5e-11
+across two thousand cells.
+
+`configs/evolve.toml` is the gate pond with the genome switched on; a test
+enforces that the two differ in nothing but the cell. `cells.genome` is off by
+default and the pre-genome path is arithmetically unchanged — checked by
+diffing 20 000 ticks of telemetry, not asserted — because every claim this
+project makes came out of an A/B against a control.
 
 ## Run it
 
@@ -72,6 +102,9 @@ mise exec -- cargo run -p hadean-headless --release -- profile --ticks 2000
 mise exec -- cargo run -p hadean-headless --release -- verify --ticks 2000
 mise exec -- cargo run -p hadean-headless --release -- ecology \
   --config configs/gate.toml --ticks 250000
+mise exec -- cargo run -p hadean-headless --release -- ecology \
+  --config configs/evolve.toml --ticks 250000
+mise exec -- cargo run -p hadean-headless --release -- chem --keys
 mise exec -- cargo test --release --workspace
 ```
 
@@ -84,10 +117,18 @@ without ever leaning on the safety cap.
 Runs can emit audit/population telemetry with `--csv runs/pond.csv` and resume
 bit-identically through `--out runs/pond.snap` / `--resume runs/pond.snap`.
 
+`chem --keys` is the measurement behind the genome's recognition widths: it
+reports how far apart the chemistry's affinity keys actually are, and how many
+reactions one enzyme reaches at each width. The first widths in this project
+were guessed, and were wrong by a factor that made every ancestor's enzyme
+match nothing at all.
+
 `configs/pond.toml` is the world at full size; `configs/gate.toml` is the same
 world at an eighth of the volume, which is where the population gate is tuned
 and where it runs in twenty minutes rather than an afternoon. Everything but
 the grid and the cell lifecycle numbers is identical, and a test enforces that.
+`configs/evolve.toml` is `gate.toml` with the genome on and nothing else
+changed, enforced by another.
 
 ## The sun has to move
 

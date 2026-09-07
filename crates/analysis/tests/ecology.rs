@@ -237,6 +237,50 @@ fn the_gate_preset_is_the_pond_in_everything_but_size_and_lifecycle() {
     World::new(gate).expect("gate preset builds");
 }
 
+#[test]
+fn the_evolve_preset_is_the_gate_pond_with_a_genome() {
+    // Same argument as the gate/pond parity above, and the same reason to
+    // enforce it: `evolve.toml` exists to isolate what a genome changes, and
+    // it can only do that if nothing else changed with it. A preset that
+    // quietly moved the sun or the vents alongside would make every
+    // comparison between the two worthless.
+    let gate = WorldConfig::from_toml(include_str!("../../../configs/gate.toml"))
+        .expect("gate preset parses");
+    let evolve = WorldConfig::from_toml(include_str!("../../../configs/evolve.toml"))
+        .expect("evolve preset parses");
+    evolve.validate().expect("evolve preset is a runnable world");
+
+    assert_eq!(evolve.seed, gate.seed);
+    assert_eq!(evolve.dt, gate.dt);
+    assert_eq!(evolve.grid, gate.grid, "same pond, not a smaller one");
+    assert_eq!(evolve.chemistry, gate.chemistry);
+    assert_eq!(evolve.light, gate.light, "the sun must be the same sun");
+    assert_eq!(evolve.heat, gate.heat);
+    assert_eq!(evolve.flow, gate.flow);
+    assert_eq!(evolve.vents, gate.vents);
+    assert_eq!(evolve.initial, gate.initial);
+    assert_eq!(evolve.schedule, gate.schedule);
+
+    assert!(evolve.cells.genome, "the evolve preset has no genome");
+    assert!(!gate.cells.genome, "the control preset has a genome");
+    // The lifecycle numbers are the gate's, carried over deliberately, so the
+    // only difference between the two worlds is the cell's heritable state.
+    assert_eq!(
+        hadean_cell::CellConfig {
+            genome: gate.cells.genome,
+            mutation: gate.cells.mutation,
+            enzyme_sigma: gate.cells.enzyme_sigma,
+            transport_sigma: gate.cells.transport_sigma,
+            structural_benefit: gate.cells.structural_benefit,
+            ..evolve.cells
+        },
+        gate.cells,
+        "the two presets differ somewhere other than the genome"
+    );
+
+    World::new(evolve).expect("evolve preset builds");
+}
+
 /// The Phase 2 gate. Minutes, not seconds -- run it with
 /// `cargo test --release -p hadean-analysis -- --ignored --nocapture`, or
 /// more usually as `hadean ecology --config configs/gate.toml`.

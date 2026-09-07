@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 hadean-core = { workspace = true }
 hadean-chem = { workspace = true }
+hadean-cell = { workspace = true }
 hadean-fields = { workspace = true }
 hadean-sim = { workspace = true }
 hadean-analysis = { workspace = true }

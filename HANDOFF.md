@@ -3,7 +3,8 @@
 Implementation of `PLAN.md` (a bottom-up artificial life simulation).
 Last updated during the Phase 2 population-tuning pass.
 
-**Status: Phase 0 complete, Phase 1 substantially complete, Phase 2 underway.**
+**Status: Phase 0 complete, Phase 1 substantially complete, Phase 2 underway,
+L3 genome implemented.**
 The first hardcoded protocell is integrated: membrane transport, catalysed
 metabolism, energy reserve and maintenance, Brownian/flow motion, division,
 death, and conservative decomposition. Cell state participates in audits,
@@ -16,7 +17,7 @@ made from a carbon pool with one way in and no way out, so there is nothing for
 a population to settle at. Read that section before tuning anything.
 
 ```
-mise exec -- cargo test --release --workspace          # 185 tests
+mise exec -- cargo test --release --workspace          # 199 tests
 mise exec -- cargo run -p hadean-headless --release -- verify --ticks 2000
   determinism ......... ok
   snapshot replay ..... ok
@@ -886,15 +887,378 @@ before any more seeds are tried.
 
 ---
 
+## L3: the genome
+
+The population had one heritable number and every cell in the pond catalysed
+the same reaction. `Population::metabolic_reaction` was a single
+`Option<ReactionId>`, chosen once at introduction, shared by every cell that
+would ever live. That is the mechanism underneath "the population is mining,
+not grazing": the cells were not failing to regulate and they were not badly
+tuned, they could only ever eat one thing, and on seed 1 that thing is made
+from a carbon pool with one way in and no way out.
+
+A genome does not fix that by being a better dial. It removes the "one thing".
+
+### What is in it
+
+`crates/cell/src/genome.rs`, and it is `PLAN.md`'s design rather than a
+convenient subset of it. A **linear byte string**, variable length, scanned for
+a two-byte promoter marker; junk between genes is neutral and is not compacted
+away. Each gene decodes to a promoter motif, a list of `(motif, weight)`
+regulatory binding sites, a protein class, an eight-component key, class
+parameters and a stability. Every match in the system -- enzyme to reaction,
+transporter to compound, regulator to promoter -- is the same Gaussian on key
+distance, which is what makes the fitness landscape graded rather than a field
+of cliffs.
+
+Four of the eight protein classes act on the world as it stands:
+
+| class | what it does | where it lands |
+| --- | --- | --- |
+| `Enzyme` | catalyses reactions near its key, in the exergonic direction | `metabolize` |
+| `Transporter` | raises membrane permeability for compounds near its key | `exchange` |
+| `Structural` | buys famine tolerance, and is charged for it | `maintain` |
+| `Regulator` | binds promoters, so genes regulate genes | `transcribe` |
+
+`Adhesion`, `Receptor`, `Effector` and `Neural` decode, cost upkeep and do
+nothing. They are not placeholders to be replaced -- their class codes are part
+of the genome format, and reserving them means an L5 or L6 genome stays
+readable by this decoder. Until then they are what a nonfunctional protein is
+in a real cell: a bill with nothing on the other side, and therefore selected
+against.
+
+Mutation operators are the plan's table: point substitution, small indel, gene
+duplication, gene deletion, segment inversion, whole-genome duplication, all
+config-tunable and all drawn from `Counter` so a division is a pure function of
+`(tick, parent)`. Horizontal transfer is not there; it needs genome fragments
+to exist as field entities, which is a change to the mass audit and not a
+change to this module.
+
+### Two things that are deliberately not what they look like
+
+**The old cell layer is not gone and is not a legacy path.** `cells.genome`
+is a switch, default off, and with it off the arithmetic is *identical* --
+checked, not asserted: a 20000-tick `--csv` of `gate.toml` is byte-for-byte the
+same before and after this work. Everything this project believes about its
+population came out of A/B runs against a control, and a genome that quietly
+replaced the protocell everywhere would have destroyed the control in the same
+commit that needed it most. Both cells produce an `Expression` and nothing
+downstream can tell them apart.
+
+**Protein is an energetic burden, not a material one.** Synthesis is not
+modelled as consuming amino acids, because there are no amino acids; what a
+proteome costs is upkeep, charged through the existing `trait_cost` split
+against `PROTEOME_REFERENCE`. So mass conservation is untouched and a genome
+world audits exactly as a pre-genome one does. It also means junk *DNA* is
+free while junk *protein* is not, which is the selection pressure that keeps
+genomes from bloating into a free capability store.
+
+### The bug worth reading, because it passed every test
+
+The first version mapped key bytes onto a fixed `[-2, 2]`, reasoning that
+`structural_key` is built from tanh-squashed ratios, polarities and small
+counts. Seven of its eight components are inside that. The eighth is formation
+enthalpy per atom over 1e-19 J and runs from **-9.04 to -1.49**.
+
+So every ancestor's enzyme key was clamped to -2, sat seven units from the
+reaction it was written to catalyse, and matched nothing. Sixteen founders
+arrived in a pond holding 1.15e13 particles of their own food and ate not one
+of them -- and the larder trace was flat at 1.15e13, which is exactly what the
+lifeless control looks like. Every unit test passed the whole time, because
+nothing had ever checked that a written key and a chemistry key end up in the
+same space.
+
+Keys are normalised against the chemistry now (`genome::KeyScale`), which also
+stops affinity being dominated by whichever component happens to have the
+widest units and drops dimensions the chemistry never varies -- ring count is
+zero for every compound on this seed. The test that would have caught it is
+`the_ancestor_catalyses_the_reaction_it_was_written_for`, and it asserts the
+thing the assumption was hiding: the ancestor's best match is its own reaction,
+at affinity above 0.98.
+
+This is the fourth time in this project that something was chosen by reasoning
+about a representation instead of measuring it. `choose_metabolism` has three
+entries in that column already.
+
+### The second thing that had to be a nudge
+
+Mutation's point operator redrew the byte uniformly at first. That is wrong for
+the same reason the key range was, and it is the more consequential of the two
+because it would not have shown up as a broken run -- it would have shown up as
+evolution simply not going anywhere, which is much harder to attribute.
+
+`PLAN.md` is explicit about why the representation is bytes and keys at all:
+
+> Graded mutation response. A single byte change nudges the key slightly, which
+> nudges affinity slightly. Fitness landscapes become traversable instead of a
+> field of cliffs. **This is the difference between evolution working and
+> evolution not working.**
+
+A uniform redraw moves one of eight key components to a uniformly random value.
+Measured against `enzyme_sigma`, a single redraw is enough to take a protein
+from full activity on its reaction to none, so a drifting lineage leaves its
+own metabolism without arriving at another and there is no slope to climb.
+
+Substitutions are now a step: four fifths move the byte by one to eight,
+reflecting off the ends rather than clamping, and one fifth is still a full
+redraw. The tail matters as much as the body -- a redraw is what changes a
+protein's class, breaks a promoter, or makes one out of junk, and a radical
+substitution at a key residue destroys a real protein too. What changed is that
+it is now the tail. `one_substitution_usually_moves_affinity_a_little` measures
+the distribution: the median substitution costs less than 0.35 of a unit of
+affinity, the gentlest tenth less than 0.05, and the worst twentieth more than
+0.9.
+
+Point mutations can also land on a gene's two-byte promoter marker, which
+deletes the gene outright. That is not a defect: a promoter mutation is a
+knockout, and at the ancestor's 309 bytes it happens in about one division in
+eighty.
+
+### Recognition width was measured, not chosen
+
+`hadean chem --keys` reports the nearest-neighbour spread of reaction and
+compound keys in the normalised space the genome matches in, and what one
+protein reaches at each width. On `gate.toml`:
+
+```
+  nearest neighbour   min 0.008  p25 0.062  median 0.102  p75 0.134  max 0.333
+  sigma 0.05          an enzyme reaches    2.0 reactions
+  sigma 0.08          an enzyme reaches    4.6 reactions   <- configured
+  sigma 0.12          an enzyme reaches   10.3 reactions
+  sigma  0.2          an enzyme reaches   39.0 reactions
+```
+
+`enzyme_sigma = 0.08` puts about 4.6 of the 78 thermal reactions inside one
+enzyme's reach: its own, plus a few weak neighbours for a duplicate to drift
+onto. The first guess, before this existed, was 0.35 -- which reaches 72 of 78,
+and is not a metabolism.
+
+Reach is not the same as what a lineage can *become*, and confusing the two is
+how to get this wrong in the generous direction. A narrow width still leaves
+the whole network reachable, because mutation moves the key itself. What the
+width decides is how much one protein does at once.
+
+### What the genome is being asked to find
+
+The route out of seed 1's carbon dead end **exists and is downhill**:
+
+```
+    O2 + CH2OS   -> CH2O3S           k(20C) = 8e-15   -- no route at all
+    H2 + CH2O3S  -> H2O + CH2O2S     downhill, and this remakes the food
+```
+
+The first step is unused because its barrier is too high. Lowering a barrier is
+exactly and only what an enzyme does. A lineage that evolves onto that reaction
+is a decomposer, and a pond with a decomposer in it recycles its carbon instead
+of retiring it -- which is how real ecosystems avoid running their own larder
+down, and it is not something any dial in `CellConfig` could ever have reached.
+
+That is the mechanism. It is not a prediction that the run finds it.
+
+### What the first run actually did
+
+`evolve.toml` against its own control -- the same file with every mutation rate
+at zero, which is a clone line carrying a genome and isolates what the genome's
+machinery costs from what its mutation buys. 250000 ticks, four days of world
+time, alongside the pre-genome `gate.toml` figures for scale:
+
+| | pre-genome | genome, no mutation | genome, mutating |
+| --- | --- | --- | --- |
+| peak | 140 | 144 | 141 |
+| births | 140 | 144 | 141 |
+| **births after the peak** | **0** | **0** | **0** |
+| clone lines | -- | 1 throughout | 4 -> 49 -> 0 |
+| reactions eaten | 1 | 1 | 1 |
+| food drawn down | 10.6x | 22.4x | 19.1x |
+| finish | extinct | extinct | extinct |
+
+The machinery works and it changed nothing. Forty-nine lineages against the
+control's one is the mutation operators doing exactly what they are for; the
+population is otherwise indistinguishable from a pond of clones.
+
+The CSV says why, and it is not subtle. Every column freezes at t = 480 s and
+does not move again for eight hundred seconds: population 140, lineages 49,
+mean uptake 2.428, spread 0.242, genes 6.09. The last birth in the run is at
+**t = 839 s of 2500**. A hundred and forty-one births from sixteen founders is
+one generation and a bit.
+
+**You cannot evolve anything in one generation.** No births means no new
+genomes, no new genomes means no selection, and the genome spends the rest of
+the run as an expensive way to store a constant. Every negative in the table
+above follows from that one fact, and none of it is evidence about whether a
+lineage could have found a different living -- the population never got to
+look.
+
+### The pre-run check was lying, and by a factor of five
+
+`hadean ecology` prints the turnover budget before it starts, precisely so a
+run like that can be declined rather than waited for. It printed:
+
+```
+turnover  division_reserve 1.00e-8 J against a budget of 6.00e-9 J
+          -- only the far tail of the population can fund a daughter, if anything can
+```
+
+Short by a factor of 1.7, which reads like a run worth trying. It was short by
+a factor of **8.4**.
+
+[`CellConfig::turnover_budget`] takes `trait_spread` as the population's
+standing variation `d`. For a pre-genome population that is right and is not an
+approximation: `trait_spread` *is* the kick every daughter gets. For a genome
+population it is a guess about a mechanism that is switched off. The measured
+variation in this run was a mean uptake of 2.428 with a spread of 0.242 --
+`d = 0.0997`, a fifth of the 0.5 the check assumed -- so the real budget was
+1.2e-9 J against a `division_reserve` of 1e-8.
+
+The genome's standing variation is *narrower* than the traits it replaced, and
+that is not a defect in either: `Traits::founder` draws a log-normal with sigma
+0.5 directly onto the trait, while a genome has to arrive at the same variation
+through substitutions that nudge a key by a few 255ths at a time. It is the
+difference between setting a number and evolving one, and it means a genome
+world needs its lifecycle numbers re-measured rather than inherited -- which
+was already item 6 on the list below, and is now a measurement rather than a
+worry.
+
+`ecology` now reports both: the configured budget before the run, flagged as an
+assumption when the genome is on, and the budget at the population's measured
+spread *at its peak* against the curve at the end. The peak, not the finish --
+a run that ends extinct ends with no variation at all, and a budget computed
+from that only says that everything is dead.
+
+### The engine of complexity fired 0.86 times
+
+There is a catch-22 underneath all of this, and it is worth stating separately
+because no amount of tuning removes it.
+
+In a pond with one food source, an enzyme that drifts off that food source is
+lethal. A lineage exploring the reaction network dies before it arrives
+anywhere, so selection actively suppresses the exploration that finding a
+second living requires. This is not a flaw in the implementation; it is the
+reason real evolution does not work that way either.
+
+The biological escape is **gene duplication**: keep the original enzyme doing
+its job, and let the copy drift. `PLAN.md` calls it "the engine of complexity"
+and it is the one operator in the table with a bold entry. It is implemented
+here and it works -- `duplication_grows_a_genome_and_its_gene_count` checks
+that a duplicate decodes as a second gene with the same key.
+
+At the rates in `evolve.toml` it is also, in a run like the first one, a
+mechanism that never fires:
+
+```
+    births x genes x duplication_rate  =  141 x 6.09 x 1e-3  =  0.86
+```
+
+**Under one duplication event in four days of world time.** The engine of
+complexity was expected to turn over less than once. Everything the genome
+could have discovered was gated behind an operator that, at this population's
+birth rate, statistically did not happen.
+
+That is the same finding as "one generation" seen from the other end. The
+obvious move is to buy more divisions by lowering `division_reserve` until it
+satisfies the turnover budget, and that was written here as the fix before it
+was tried.
+
+### It was tried, and buying births does not buy generations
+
+`division_reserve` at 4e-10 -- comfortably under the 1.2e-9 the measured spread
+allows -- on both `evolve.toml` and its clone control:
+
+| | genome, no mutation | genome, mutating |
+| --- | --- | --- |
+| peak | 2089 at t = 227 s | 2088 at t = 237 s |
+| births | 2089 | 2088 |
+| **births after the peak** | **0** | **0** |
+| clone lines | 1 throughout | 617 at the peak |
+| uptake spread at the end | 0.000 | 0.357 |
+| finish | extinct | extinct |
+
+Fifteen times the population and fifteen times the births, and **still not one
+birth after the peak**. The last division in the mutating run is at t = 237 s
+of 2500. What lowering `division_reserve` bought was a bigger, faster boom, not
+a second generation.
+
+The CSV says exactly what happened, and it is worth reading as a sequence:
+
+```
+t=176   pop=153    dormant=0     food=1.116e13
+t=201   pop=1801   dormant=1     food=5.270e12
+t=326   pop=2088   dormant=2088  food=3.288e10
+t=676   pop=2075   dormant=2075  food=2.059e11     <- food recovered 6x
+t=1176  pop=1888   dormant=1888  food=2.814e03
+```
+
+The population overshoots to 2088 in ninety seconds, strips the pond by a
+factor of 340, and goes **100% dormant at t = 326 s -- and never wakes**. Not
+one cell wakes even at t = 676, when the night has put six times as much food
+back in the water. Two thousand cells sharing a recovered larder is still less
+per cell than the wake-up bar, so they sit shut down until starvation damage
+kills them one at a time over the following twenty minutes.
+
+Dormant cells do not divide. So the plateau is not a population choosing not to
+breed, it is a population that has switched itself off, and `division_reserve`
+does not reach that.
+
+**This was predicted here before it was run**, in the `gate.toml` note on
+`division_reserve`: "At 2e-10 the cells double every fifteen seconds, strip a
+day's food by mid-afternoon, and meet the night with nothing. At 3e-9 they
+still overshoot and die on the fourth night." 4e-10 is squarely in the regime
+that note describes, and the run did precisely what it says.
+
+### Where that leaves it
+
+Both ends of the dial give the same answer for opposite reasons:
+
+* At `division_reserve = 1e-8`, no cell at the margin can afford a daughter, so
+  the plateau has no births in it. One generation.
+* At `4e-10`, the response is fast enough to overshoot into total dormancy, so
+  the plateau has no *waking cells* in it. One generation.
+
+There may be a window between them and it is worth one sweep. But the reason
+both ends collapse to one generation is the same reason, and it is not in
+`CellConfig`: **a population with a finite larder has no steady state to have
+generations in.** Births balancing deaths is what a carrying capacity *is*, and
+this pond does not have one for this metabolism -- which is the finding from
+"The population is mining, not grazing", arrived at from a third direction.
+
+So the genome is not the thing that is blocked; it is blocked behind the thing
+that was already blocking everything. It cannot be evaluated on seed 1 as
+configured, because a genome is a mechanism for adapting across generations and
+this world affords one. The next measurement is still the renewable-living one,
+and the genome is what will make use of it when it exists.
+
+What the run does establish, and it is not nothing: the machinery is sound
+under real load. 617 lineages against a control's 1, standing variation of
+0.357 against a control's exactly 0.000, gene counts moving, energy audit flat
+at -4.7e-11 relative across two thousand cells' worth of transcription,
+transport and catalysis. When there is a living to adapt to, the thing that
+would do the adapting works.
+
+---
+
 ## What is left
 
 ### Immediately outstanding
 
-1. **Give the population a renewable living.** This is the one that matters and
-   it is not in `CellConfig`. See "The population is mining, not grazing": the
-   ancestor's food on seed 1 is made from a carbon pool with one way in and no
-   way out, so there is no carrying capacity to find. Two routes, and they are
-   complementary:
+0. **Nothing in the genome layer can be measured until the pond has a steady
+   state.** Every mutation rate in the table is per-division, so a population
+   that stops dividing has switched the whole layer off -- and on seed 1 it
+   always stops. At `division_reserve = 1e-8` the plateau has no births in it;
+   at 4e-10 it overshoots into total dormancy and has no waking cells in it.
+   Both give exactly one generation, for the same underlying reason: births
+   balancing deaths is what a carrying capacity *is*, and this pond does not
+   have one. This is item 1 wearing a different hat, and it is why item 1 is
+   still item 1. See "It was tried, and buying births does not buy
+   generations".
+1. **Give the population a renewable living.** Still the one that matters, and
+   still not in `CellConfig`. The genome makes a renewable living *reachable*
+   -- a lineage that evolves onto the waste-recycling reaction closes the
+   carbon loop, which no dial could ever have done -- but reachable is not
+   found, and on the evidence so far the population never got enough births to
+   look. See "The population is mining, not grazing": the ancestor's food on
+   seed 1 is made from a carbon pool with one way in and no way out, so there
+   is no carrying capacity to find. Two routes that do not depend on evolution
+   finding it, and they are complementary:
    * Make `choose_metabolism` weigh a *rate* rather than a standing amount. The
      vents' injection rate is exactly known from the config, and a perturbation
      of the settled lifeless pond measures the rest. It has been wrong three
@@ -916,10 +1280,24 @@ before any more seeds are tried.
 4. The tuned numbers have only been run at 24×24×10. The full pond is twice as
    deep, which changes both the light gradient and the volume behind each
    square metre of surface, so they may not carry over unchanged.
-5. `Traits` holds one field. `metabolic_rate` was left out of it deliberately:
-   at the configured 20/s the membrane is the bottleneck, so a trait on it
-   would be a dial attached to nothing, and this project has already learned
-   what one of those costs to diagnose. Add it when the regime changes.
+5. `Traits` holds one field and is now the pre-genome path only. It is kept
+   because it is the control, not because it is expected to grow: a trait to
+   add belongs in a protein class.
+6. **The lifecycle numbers have not been re-measured for a genome cell**, and
+   should not be trusted on `evolve.toml`. A genome cell's membrane is
+   `1 + transporters` rather than one flat multiplier, so at the same
+   `membrane_scale` it takes up its food roughly twice as fast, and everything
+   that turns on the break-even concentration has moved. The dials' meanings
+   hold; their values were measured against a different cell.
+7. **Horizontal gene transfer is not implemented** and is the largest missing
+   piece of `PLAN.md`'s L3. It needs a lysing cell's genome to enter the voxel
+   as a compound-like entity, which is a change to the mass audit rather than
+   to `genome.rs`. The plan is emphatic about what it buys: good ideas
+   propagate laterally instead of waiting for a lineage to reinvent them.
+8. **Mutator alleles** -- a `Regulator` modulating the cell's own mutation
+   rate, so mutation rate itself evolves -- are in the plan, cost almost
+   nothing, and are not done. The hook is that `replicate` already takes rates
+   as a parameter rather than reading a constant.
 
 ### Phase 1 remainder
 
@@ -933,17 +1311,23 @@ before any more seeds are tried.
 
 ### Phase 2 remainder and beyond
 
-Cell collision/soft-sphere physics and rendering are still absent. L3 genome,
-L5 multicellularity, L6 nervous systems, and L7 viewer have not started.
+Cell collision/soft-sphere physics and rendering are still absent. L5
+multicellularity, L6 nervous systems, and L7 viewer have not started.
 
-Two hooks are already in place for L3:
+L3 is in — see "L3: the genome" above. One of the two hooks that were waiting
+for it is spent and one is not:
 
-* `Network::step_voxel` takes a `catalysis: &[f64]` slice of per-reaction
-  activation-energy reductions. It is empty everywhere today. Enzymes plug in
-  there, and only catalysed reactions pay for an `exp()`.
 * Every compound carries a `key: [f32; 8]` structural descriptor and every
-  reaction carries the mean of its participants' keys, so the plan's
-  affinity-by-key-similarity scheme has its substrate ready.
+  reaction carries the mean of its participants' keys. **This is what the
+  genome matches against**, through `genome::KeyScale`, and it worked as the
+  plan intended.
+* `Network::step_voxel` still takes an empty `catalysis: &[f64]`. A genome
+  cell's enzymes act on its *own contents*, in `metabolize`, not on the voxel
+  it sits in — which is right for an intracellular enzyme and keeps the cell's
+  f64 exactness. That slice is now for **secreted** enzymes, which is a
+  different thing and needs `Effector` to do something: a protein a cell
+  releases into the water, which is where extracellular digestion and
+  predation come from.
 
 ---
 

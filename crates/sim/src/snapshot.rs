@@ -15,6 +15,9 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
+use std::sync::Arc;
+
+use hadean_cell::genome::Genome;
 use hadean_cell::{Cell, CellState, Traits};
 use hadean_chem::element::N_ELEMENTS;
 use hadean_core::hash::HashState;
@@ -24,7 +27,7 @@ use crate::config::WorldConfig;
 use crate::world::World;
 
 const MAGIC: &[u8; 8] = b"HADEANv1";
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 /// zstd level 3 is the usual sweet spot: most of the ratio, little of the cost.
 const COMPRESSION: i32 = 3;
 
@@ -73,6 +76,17 @@ pub fn save(world: &World) -> anyhow::Result<Vec<u8>> {
         // Heritable state. A cell's traits are its ancestry, not a function of
         // its id, so unlike its lifespan they cannot be re-derived on load.
         put_f32(&mut raw, cell.traits.uptake);
+        // The genome, bytes only. Its decode and its bindings against the
+        // chemistry are pure functions of those bytes and that chemistry --
+        // the same argument that keeps the compound pool out of a snapshot --
+        // so writing them too would be a second copy that could disagree with
+        // the first. The proteome is not: it is the cell's own state and two
+        // sisters carrying identical bytes do not carry identical protein.
+        match &cell.genome {
+            None => put_u64(&mut raw, u64::MAX),
+            Some(g) => put_bytes(&mut raw, &g.bytes),
+        }
+        put_f32s(&mut raw, &cell.proteome);
     }
 
     let a = &world.audit;
@@ -176,6 +190,32 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
         let traits = Traits {
             uptake: cursor.f32()?,
         };
+        let genome = match cursor.peek_u64()? {
+            u64::MAX => {
+                cursor.u64()?;
+                None
+            }
+            _ => {
+                let bytes = cursor.bytes()?.to_vec();
+                let mut g = Genome::new(bytes);
+                g.bind(
+                    &world.chem,
+                    world.config.cells.enzyme_sigma,
+                    world.config.cells.transport_sigma,
+                );
+                Some(Arc::new(g))
+            }
+        };
+        let proteome = cursor.f32s()?;
+        if let Some(g) = &genome {
+            if proteome.len() != g.genes.len() {
+                anyhow::bail!(
+                    "cell {id} carries {} proteins for {} genes",
+                    proteome.len(),
+                    g.genes.len()
+                );
+            }
+        }
         world.cells.cells.push(Cell {
             id,
             parent: (parent != u64::MAX).then_some(parent),
@@ -188,6 +228,8 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
             state,
             generation,
             traits,
+            genome,
+            proteome,
         });
     }
 
@@ -299,6 +341,19 @@ impl<'a> Cursor<'a> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into()?))
     }
 
+    /// Read a length prefix without consuming it.
+    ///
+    /// A cell with no genome writes `u64::MAX` where a length would be, which
+    /// is a length no snapshot can legitimately carry. One byte of tag would
+    /// do the same job; this keeps every field in the cell record eight-byte
+    /// aligned, which the rest of the format already is.
+    fn peek_u64(&mut self) -> anyhow::Result<u64> {
+        let at = self.at;
+        let v = self.u64()?;
+        self.at = at;
+        Ok(v)
+    }
+
     fn bytes(&mut self) -> anyhow::Result<&'a [u8]> {
         let n = self.u64()? as usize;
         self.take(n)
@@ -370,6 +425,18 @@ mod tests {
         // skipped them would hand back a plausible cell that is not this one.
         let mut w = World::new(small()).expect("builds");
         w.run(40);
+        let genes = {
+            let reaction = w
+                .chem
+                .reactions
+                .iter()
+                .find(|r| r.dh < 0.0)
+                .expect("an exergonic reaction")
+                .id;
+            hadean_cell::genome::ancestor(&w.chem, reaction, &hadean_core::Counter::new(7), 0)
+                .genes
+                .len()
+        };
         w.cells.cells.push(Cell {
             id: 9_000,
             parent: None,
@@ -382,12 +449,46 @@ mod tests {
             state: CellState::Dormant,
             traits: Traits { uptake: 1.75 },
             generation: 2,
+            // A genome goes in for the same reason the traits do, and one more:
+            // its decode is *not* written to the snapshot, so a reader that
+            // forgot to rebuild it would hand back a cell whose genes and
+            // bindings are empty. The digest covers the bytes; the assertions
+            // below cover the decode.
+            genome: Some(Arc::new({
+                let reaction = w
+                    .chem
+                    .reactions
+                    .iter()
+                    .find(|r| r.dh < 0.0)
+                    .expect("an exergonic reaction")
+                    .id;
+                let mut g = hadean_cell::genome::ancestor(
+                    &w.chem,
+                    reaction,
+                    &hadean_core::Counter::new(7),
+                    0,
+                );
+                g.bind(
+                    &w.chem,
+                    w.config.cells.enzyme_sigma,
+                    w.config.cells.transport_sigma,
+                );
+                g
+            })),
+            proteome: vec![0.5; genes],
         });
         let digest = w.state_digest();
 
         let back = load(&save(&w).expect("saves")).expect("loads");
         assert_eq!(back.state_digest(), digest);
         assert_eq!(back.cells.dormant(), 1);
+        let reloaded = back.cells.cells.last().expect("the cell");
+        let genome = reloaded.genome.as_ref().expect("the genome came back");
+        assert_eq!(genome.genes.len(), genes, "the decode was not rebuilt");
+        assert!(
+            genome.targets.iter().any(|t| !t.reactions.is_empty()),
+            "the enzyme was not rebound to the chemistry"
+        );
         assert_eq!(back.cells.cells.last().expect("the cell"), w.cells.cells.last().expect("the cell"));
     }
 

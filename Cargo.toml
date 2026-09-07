@@ -24,7 +24,7 @@ hadean-cell = { path = "crates/cell" }
 hadean-sim = { path = "crates/sim" }
 hadean-analysis = { path = "crates/analysis" }
 
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"

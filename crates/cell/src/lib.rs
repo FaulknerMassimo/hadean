@@ -1,14 +1,31 @@
-//! **L4 -- hardcoded protocells.**
+//! **L4 cells, with or without an L3 genome.**
 //!
-//! This is deliberately the pre-genome cell from Phase 2. Every cell has the
-//! same membrane and catalyses the same generated reaction. The important
-//! result is a complete material lifecycle: compounds cross a membrane, an
+//! Two cells live here and they share every mechanism below the top.
+//!
+//! The **pre-genome protocell** is the Phase 2 ancestor: every cell has the
+//! same membrane and catalyses the same generated reaction, and what it
+//! inherits is one scalar. It is kept because it is the control. Its result --
+//! a complete material lifecycle, where compounds cross a membrane, an
 //! exergonic reaction charges a reserve, maintenance drains it, cells divide,
-//! and dead cells return every particle and joule to the pond.
+//! and dead cells return every particle and joule to the pond -- is what every
+//! claim about the genome is measured against.
+//!
+//! The **genome cell** (`cells.genome = true`) replaces that scalar with a
+//! byte string. It does not add a lifecycle; it changes where the numbers in
+//! one come from. What a cell takes up, what it catalyses and what it costs
+//! are read out of [`genome`], and every one of them can mutate.
+//!
+//! The two paths meet at [`Expression`], which is the only thing the lifecycle
+//! functions below read. A pre-genome cell fills it from its traits and a
+//! genome cell from its proteome, and neither `exchange`, `metabolize` nor
+//! `maintain` knows which it was handed. That is deliberate: it keeps the
+//! pre-genome path arithmetically identical to what it was, so the control is
+//! a real control and not a reimplementation of one.
 
 use std::f32::consts::PI;
+use std::sync::Arc;
 
-use hadean_chem::{Chemistry, Drive, Reaction, ReactionId};
+use hadean_chem::{Chemistry, Drive, ReactionId};
 use hadean_core::hash::{HashState, StateHasher};
 use hadean_core::rng::Purpose;
 use hadean_core::units::{Joules, KB, VISCOSITY};
@@ -17,6 +34,10 @@ use hadean_fields::heat::HeatField;
 use hadean_fields::scalar::ChemField;
 use hadean_fields::transport::FaceVelocity;
 use serde::{Deserialize, Serialize};
+
+pub mod genome;
+
+pub use genome::{Genome, MutationRates, ProteinClass};
 
 /// Tunables for the hand-authored ancestor used before genomes exist.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -162,7 +183,66 @@ pub struct CellConfig {
     /// life in it, and what life finds is a chemistry already at its
     /// photostationary state. Zero introduces them at tick zero.
     pub seed_delay: f32,
+
+    // ---- L3 ----------------------------------------------------------------
+    /// Give cells a genome instead of the hardcoded traits.
+    ///
+    /// Off by default, and that is not timidity. Everything this project
+    /// believes about its own population came out of A/B runs against a
+    /// control, and a genome that quietly replaced the protocell everywhere
+    /// would destroy the control in the same commit that needed it. With this
+    /// off the cell layer is arithmetically what it was; with it on, `traits`
+    /// is dead weight and [`Genome`] decides.
+    pub genome: bool,
+    /// Mutation operator rates, applied at every division. See
+    /// [`MutationRates`].
+    pub mutation: MutationRates,
+    /// Width of an enzyme's recognition of a reaction, in key-space distance.
+    ///
+    /// The most consequential number in the genome layer, because it sets what
+    /// one protein can do at once. Too small and an enzyme catalyses its own
+    /// reaction and nothing else; too large and it catalyses half the network,
+    /// which is not a metabolism, it is a fire.
+    ///
+    /// Measured, not chosen. `hadean chem --keys` reports the spread of the
+    /// chemistry's keys in the normalised space the genome matches in, and on
+    /// `gate.toml` the thermal reactions have a median nearest-neighbour
+    /// distance of 0.102. 0.08 puts about 4.6 reactions inside one enzyme's
+    /// reach -- its own plus a few weak neighbours, which is a specialist with
+    /// the promiscuity `PLAN.md` wants duplication to act on. 0.2 would reach
+    /// 39 of 78 and 0.35 would reach 72.
+    ///
+    /// Reach is not the same as what a lineage can *become*, and confusing the
+    /// two is the way to get this wrong in the generous direction. A width
+    /// this narrow still leaves the whole network reachable, because mutation
+    /// moves the key itself: what the width decides is how much a protein does
+    /// at once, not where its descendants can go.
+    pub enzyme_sigma: f32,
+    /// Width of a transporter's recognition of a compound.
+    ///
+    /// Wider than `enzyme_sigma` because compounds are further apart than
+    /// reactions are -- a reaction key is the mean of its participants', and
+    /// averaging pulls them together. Median nearest neighbour is 0.229
+    /// against the reactions' 0.102, and 0.15 puts about three compounds
+    /// inside a transporter's reach.
+    pub transport_sigma: f32,
+    /// Multiplier on `starvation_time` bought by a full structural complement.
+    ///
+    /// What structural protein is *for*, and the reason it is a class rather
+    /// than a constant: it buys famine tolerance and charges upkeep for it, so
+    /// how much to carry is a trade a lineage makes against how hungry its
+    /// pond is, not a number in this file.
+    pub structural_benefit: f32,
 }
+
+/// Total standing protein a cell carrying the hand-written ancestor's genome
+/// expresses, summed over its genes.
+///
+/// A cell's upkeep is charged against this, so the ancestor pays very close to
+/// `maintenance_power` and means the same thing it meant before genomes
+/// existed. A lineage that doubles its proteome doubles the machinery half of
+/// its bill, which is what stops a genome from being a free capability store.
+pub const PROTEOME_REFERENCE: f32 = 4.0;
 
 impl Default for CellConfig {
     fn default() -> Self {
@@ -185,6 +265,11 @@ impl Default for CellConfig {
             dormancy_exit: 60.0,
             decomposition_rate: 0.8,
             seed_delay: 150.0,
+            genome: false,
+            mutation: MutationRates::default(),
+            enzyme_sigma: 0.08,
+            transport_sigma: 0.15,
+            structural_benefit: 2.0,
         }
     }
 }
@@ -229,6 +314,13 @@ impl CellConfig {
         {
             return Err("cell lifecycle rates and thresholds must be positive".into());
         }
+        self.mutation.validate()?;
+        if self.enzyme_sigma <= 0.0 || self.transport_sigma <= 0.0 {
+            return Err("genome recognition widths must be positive".into());
+        }
+        if self.structural_benefit < 1.0 || !self.structural_benefit.is_finite() {
+            return Err("structural benefit is a multiplier and cannot be below one".into());
+        }
         Ok(())
     }
 
@@ -244,8 +336,13 @@ impl CellConfig {
     /// it, and without births there is no recovery leg to the Phase 2 gate
     /// however healthy the curve looks on the way up.
     ///
-    /// `trait_spread` stands in for `d` here, so this is one standard
-    /// deviation's worth of advantage. The best cell of a few hundred is two
+    /// `trait_spread` stands in for `d` here, which is right for a pre-genome
+    /// population -- it is exactly the kick every daughter gets -- and is only
+    /// a guess for a genome one, whose variation is whatever its mutation
+    /// operators happen to produce. Use
+    /// [`TraitSummary::relative_spread`] against a running population for the
+    /// measured version. So this is one standard deviation's worth of
+    /// advantage. The best cell of a few hundred is two
     /// or three of those out, and against that the real ceiling is a small
     /// multiple of this -- while the sublinearity noted on `trait_spread`
     /// pushes the other way. It is an order-of-magnitude check, and it is
@@ -386,8 +483,23 @@ pub struct Cell {
     pub age: f32,
     pub state: CellState,
     pub generation: u32,
-    /// What this cell inherited. See [`Traits`].
+    /// What this cell inherited before genomes. See [`Traits`]. Ignored when
+    /// the cell carries a `genome`.
     pub traits: Traits,
+    /// L3. `None` when the world runs the pre-genome protocell.
+    ///
+    /// Shared: a daughter that inherits her mother's bytes unchanged -- which
+    /// at the default rates is most of them -- shares the allocation and the
+    /// decode with her, so a colony of clones costs one genome between them.
+    pub genome: Option<Arc<Genome>>,
+    /// Concentration of each gene's protein, 0..1, indexed by gene.
+    ///
+    /// This is where the same genome becomes two different cells, and it is
+    /// the reason the proteome is per-cell state while the genome is shared.
+    /// Nothing reads it yet that varies between siblings; what it is for is
+    /// L5, where position and signal drive expression and one genome has to
+    /// produce a body with different tissues in it.
+    pub proteome: Vec<f32>,
 }
 
 impl Cell {
@@ -407,7 +519,41 @@ impl Cell {
 
     /// The membrane permeability multiplier this cell actually runs.
     pub fn membrane_scale(&self, cfg: &CellConfig) -> f64 {
-        cfg.membrane_scale as f64 * self.traits.uptake as f64
+        cfg.membrane_scale as f64 * self.uptake() as f64
+    }
+
+    /// How much transport machinery this cell carries, ancestor-relative.
+    ///
+    /// One number out of what is, for a genome cell, a per-compound profile,
+    /// and it exists so that the trait charts and the population summary keep
+    /// reading the same column across both cell types. A genome cell's real
+    /// uptake is not a scalar -- see [`Expression::uptake`].
+    pub fn uptake(&self) -> f32 {
+        match &self.genome {
+            None => self.traits.uptake,
+            Some(g) => {
+                let mut total = 0.0;
+                for (gene, &conc) in g.genes.iter().zip(&self.proteome) {
+                    if gene.class == ProteinClass::Transporter {
+                        total += conc * gene.strength();
+                    }
+                }
+                total
+            }
+        }
+    }
+
+    /// Standing machinery, ancestor-relative. The thing upkeep is charged on.
+    pub fn machinery(&self) -> f64 {
+        match &self.genome {
+            None => self.traits.uptake as f64,
+            // Every protein, not just the useful ones. A cell expressing a
+            // receptor that nothing reads is still paying to keep it, which is
+            // what makes an inert gene a cost a lineage can shed.
+            Some(_) => {
+                (self.proteome.iter().sum::<f32>() / PROTEOME_REFERENCE) as f64
+            }
+        }
     }
 
     /// What staying alive costs this cell, W.
@@ -415,7 +561,32 @@ impl Cell {
     /// Part fixed cost of being a cell, part the machinery it carries; see
     /// [`CellConfig::trait_cost`] for why the split is the whole point.
     pub fn maintenance(&self, cfg: &CellConfig) -> f64 {
-        cfg.maintenance_power * (1.0 - cfg.trait_cost + cfg.trait_cost * self.traits.uptake as f64)
+        cfg.maintenance_power * (1.0 - cfg.trait_cost + cfg.trait_cost * self.machinery())
+    }
+
+    /// How long this cell can go unpaid before the damage is lethal, seconds.
+    ///
+    /// Structural protein is what buys the difference.
+    pub fn famine_tolerance(&self, cfg: &CellConfig) -> f32 {
+        let Some(g) = &self.genome else {
+            return cfg.starvation_time;
+        };
+        let mut structure = 0.0;
+        for (gene, &conc) in g.genes.iter().zip(&self.proteome) {
+            if gene.class == ProteinClass::Structural {
+                structure += conc * gene.strength();
+            }
+        }
+        cfg.starvation_time * (1.0 + (cfg.structural_benefit - 1.0) * structure.min(1.0))
+    }
+
+    /// Genes, for the run log. Zero for a pre-genome cell.
+    pub fn gene_count(&self) -> usize {
+        self.genome.as_ref().map_or(0, |g| g.genes.len())
+    }
+
+    pub fn genome_len(&self) -> usize {
+        self.genome.as_ref().map_or(0, |g| g.len())
     }
 
     pub fn chemical_energy(&self, chem: &Chemistry) -> Joules {
@@ -445,6 +616,17 @@ impl HashState for Cell {
         h.byte(self.state as u8);
         h.u32(self.generation);
         self.traits.hash_state(h);
+        // A genome is heritable state and belongs in the digest, but a
+        // pre-genome cell must hash exactly as it did before this existed --
+        // otherwise every recorded digest in the project changes for a
+        // mechanism that is switched off.
+        if let Some(g) = &self.genome {
+            g.hash_state(h);
+            h.usize(self.proteome.len());
+            for &c in &self.proteome {
+                h.f32(c);
+            }
+        }
     }
 }
 
@@ -498,6 +680,17 @@ impl Population {
         if self.metabolic_reaction.is_none() {
             return;
         }
+        // The hand-written ancestor, matched to this world's chemistry. Built
+        // once: the founding cohort are siblings, and they differ from each
+        // other by the same mutation operators that will act on every division
+        // afterwards, rather than by a separate founder-only mechanism.
+        let founder = cfg.genome.then(|| {
+            let reaction = self.metabolic_reaction.expect("checked above");
+            let mut a = genome::ancestor(chem, reaction, rng, 0);
+            a.bind(chem, cfg.enzyme_sigma, cfg.transport_sigma);
+            Arc::new(a)
+        });
+
         let (ex, ey, ez) = grid.extent();
         for id in 0..cfg.initial_count as u64 {
             // Start throughout the water column. The ancestor's preferred
@@ -518,6 +711,17 @@ impl Population {
                 state: CellState::Alive,
                 generation: 0,
                 traits: Traits::founder(cfg, rng, id),
+                // Tick zero, entity `id`: a founder's mutations are a pure
+                // function of which founder it is, like its lifespan and its
+                // position, so the cohort is settled before the world starts
+                // rather than by the order they were pushed. Founders whose
+                // draw came up empty share the ancestor's allocation with each
+                // other, which is what makes them one clone line rather than
+                // sixteen identical ones.
+                genome: founder
+                    .as_ref()
+                    .map(|a| inherit_genome(a, cfg, chem, rng, 0, id)),
+                proteome: Vec::new(),
             });
         }
         self.next_id = self.cells.len() as u64;
@@ -563,11 +767,32 @@ impl Population {
         let mut n = 0.0;
         let mut sum = 0.0;
         let mut sum_sq = 0.0;
+        let mut genes = 0.0;
+        let mut bytes = 0.0;
+        // Distinct genomes, counted by content.
+        //
+        // Pointer identity would be cheaper and is what an `Arc` already
+        // tracks -- it is shared exactly when a lineage replicated without
+        // mutating -- but an address freed by the last cell of a dead lineage
+        // can be handed straight back to a new one, and then two unrelated
+        // genomes count as one. A metric that quietly undercounts diversity is
+        // worse than a slower one.
+        let mut lineages: Vec<u64> = Vec::new();
         for cell in self.cells.iter().filter(|c| c.is_alive()) {
-            let u = cell.traits.uptake as f64;
+            let u = cell.uptake() as f64;
             n += 1.0;
             sum += u;
             sum_sq += u * u;
+            genes += cell.gene_count() as f64;
+            bytes += cell.genome_len() as f64;
+            if let Some(g) = &cell.genome {
+                let mut h = StateHasher::new();
+                g.hash_state(&mut h);
+                let id = h.finish();
+                if let Err(i) = lineages.binary_search(&id) {
+                    lineages.insert(i, id);
+                }
+            }
         }
         if n == 0.0 {
             return TraitSummary::default();
@@ -576,7 +801,56 @@ impl Population {
         TraitSummary {
             mean_uptake: mean,
             uptake_spread: (sum_sq / n - mean * mean).max(0.0).sqrt(),
+            mean_genes: genes / n,
+            mean_genome_bytes: bytes / n,
+            distinct_genomes: lineages.len(),
         }
+    }
+
+    /// What the living population currently catalyses, and how many cells
+    /// catalyse each thing.
+    ///
+    /// The reading the genome exists to make possible. A pre-genome population
+    /// returns one row for ever, because one reaction is all any of them can
+    /// ever run; a genome population's rows are its diet, and a second row
+    /// appearing partway through a run is a lineage that found a different
+    /// living. Sorted by reaction id, so the same population always reports in
+    /// the same order.
+    pub fn diet(&self) -> Vec<(ReactionId, usize)> {
+        let mut rows: Vec<(ReactionId, usize)> = Vec::new();
+        let mut bump = |id: ReactionId| match rows.binary_search_by_key(&id, |r| r.0) {
+            Ok(i) => rows[i].1 += 1,
+            Err(i) => rows.insert(i, (id, 1)),
+        };
+        for cell in self.cells.iter().filter(|c| c.is_alive()) {
+            match &cell.genome {
+                None => {
+                    if let Some(id) = self.metabolic_reaction {
+                        bump(id);
+                    }
+                }
+                Some(g) => {
+                    // The reaction each enzyme runs hardest. A promiscuous
+                    // enzyme touches several weakly and reporting all of them
+                    // would drown the row that pays the bills.
+                    for ((gene, targets), &conc) in
+                        g.genes.iter().zip(&g.targets).zip(&cell.proteome)
+                    {
+                        if gene.class != ProteinClass::Enzyme || conc <= 0.05 {
+                            continue;
+                        }
+                        if let Some(&(id, _)) = targets
+                            .reactions
+                            .iter()
+                            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        {
+                            bump(id);
+                        }
+                    }
+                }
+            }
+        }
+        rows
     }
 
     pub fn stored_energy(&self, chem: &Chemistry) -> Joules {
@@ -621,6 +895,8 @@ impl Population {
         // Walking `chem.compounds` per cell drags a molecule, a name and two
         // spectra through the cache to read two floats. Flatten them once.
         let table = CompoundTable::new(chem);
+        let mut expression = Expression::new(chem);
+        let mut levels = Vec::new();
         let mut daughters = Vec::new();
         // Corpses are retained while their conserved contents cross back into
         // the fields, but they must not consume a slot in the *living*
@@ -647,10 +923,15 @@ impl Population {
                         dt,
                         heat.temperature(cell.voxel(grid)),
                     );
-                    exchange(cell, cfg, grid, &table, amounts, residual, dt);
-                    if let Some(id) = metabolism {
-                        metabolize(cell, cfg, grid, chem.reaction(id), &table, heat, dt);
-                    }
+                    // What this cell's heritable state comes to today. For a
+                    // pre-genome cell this is its one trait and its one
+                    // reaction; for a genome cell it is whatever its proteome
+                    // currently expresses, which changed since last tick and
+                    // will change again.
+                    transcribe(cell, &mut levels, dt);
+                    expression.read(cell, metabolism);
+                    exchange(cell, cfg, grid, &table, &expression, amounts, residual, dt);
+                    metabolize(cell, cfg, grid, chem, &expression, &table, heat, dt);
                     maintain(cell, cfg, grid, heat, dt);
                     cell.age += dt as f32;
                     cell.radius = growth_radius(cfg, cell.reserve);
@@ -664,7 +945,7 @@ impl Population {
                         && Schedule::due_for(tick, cell.id, growth_interval)
                         && cell.reserve >= cfg.division_reserve
                     {
-                        let child = divide(cell, cfg, grid, rng, tick, self.next_id);
+                        let child = divide(cell, cfg, chem, grid, rng, tick, self.next_id);
                         self.next_id += 1;
                         self.births += 1;
                         division_slots -= 1;
@@ -710,6 +991,43 @@ pub struct TraitSummary {
     pub mean_uptake: f64,
     /// Standard deviation of `uptake` across the living population.
     pub uptake_spread: f64,
+    /// Mean decoded genes per living cell. Zero without genomes.
+    ///
+    /// `PLAN.md` asks for this column by name: a healthy run shows genome
+    /// length growing and then stabilising, and monotonic shrinkage means the
+    /// upkeep charged per protein is too harsh for anything to be worth
+    /// keeping.
+    pub mean_genes: f64,
+    /// Mean genome length in bytes, junk included.
+    pub mean_genome_bytes: f64,
+    /// Distinct genome allocations among the living -- clone lines.
+    ///
+    /// One means the population has become a single clone, which is the freeze
+    /// that individual traits were introduced to break, arriving by a longer
+    /// road. It is the number to watch beside the population.
+    pub distinct_genomes: usize,
+}
+
+impl TraitSummary {
+    /// Standing variation as a fraction of the mean -- the `d` in the turnover
+    /// budget, measured off the population instead of assumed.
+    ///
+    /// [`CellConfig::turnover_budget`] takes `trait_spread` as its stand-in
+    /// for this, which is right for a pre-genome population because
+    /// `trait_spread` *is* the mutational kick every daughter gets. It is
+    /// wrong for a genome population, where variation is whatever the genome
+    /// happens to be producing, and wrong by enough to matter: the first
+    /// `evolve.toml` run settled at a mean uptake of 2.428 with a spread of
+    /// 0.242, so `d` was 0.0997 against the 0.5 the pre-run check assumed. The
+    /// check said the budget was short by a factor of 1.7 when it was short by
+    /// a factor of 8.4.
+    pub fn relative_spread(&self) -> f64 {
+        if self.mean_uptake > 0.0 {
+            self.uptake_spread / self.mean_uptake
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Mean particles per voxel a compound needs before it counts as food at all.
@@ -774,6 +1092,102 @@ pub fn choose_metabolism(chem: &Chemistry, abundance: &[f64], voxels: usize) -> 
         .map(|(id, _)| id)
 }
 
+/// What a cell's heritable state comes to, this tick, in the units the
+/// lifecycle actually uses.
+///
+/// Both cell types produce one of these and nothing downstream can tell them
+/// apart. That is the point of the type: `exchange`, `metabolize` and
+/// `maintain` are the audited, measured code from Phase 2, and they keep
+/// working on a genome cell without being rewritten to understand one.
+///
+/// Reused across cells rather than allocated per cell per tick -- there are
+/// two vectors here the length of the compound and reaction pools, and a
+/// population of a few hundred would otherwise allocate them a few hundred
+/// times a tick.
+pub struct Expression {
+    /// Membrane permeability multiplier, per compound.
+    ///
+    /// A genome cell's is `1 + transporters`: the one is the lipid bilayer,
+    /// which passes small nonpolar molecules whatever the cell would prefer,
+    /// and the rest is machinery it evolved. So a cell can specialise on its
+    /// food without ever being able to seal itself off, which is both the
+    /// physics and the thing that stops a lineage from mutating into a sealed
+    /// box that starves.
+    pub uptake: Vec<f32>,
+    /// Catalysed rate per reaction, in multiples of `metabolic_rate`.
+    pub catalysis: Vec<f32>,
+    /// Reactions with a nonzero rate, ascending. Applied in id order, which is
+    /// the same convention the field chemistry uses and for the same reason:
+    /// the result depends on the order, so the order has to be fixed.
+    pub active: Vec<ReactionId>,
+}
+
+impl Expression {
+    pub fn new(chem: &Chemistry) -> Self {
+        Self {
+            uptake: vec![0.0; chem.n_compounds()],
+            catalysis: vec![0.0; chem.reactions.len()],
+            active: Vec::new(),
+        }
+    }
+
+    /// Read one cell's heritable state into this scratch.
+    pub fn read(&mut self, cell: &Cell, metabolism: Option<ReactionId>) {
+        for r in self.active.drain(..) {
+            self.catalysis[r as usize] = 0.0;
+        }
+
+        let Some(g) = &cell.genome else {
+            // The pre-genome protocell: one multiplier for every compound and
+            // one reaction for every cell.
+            self.uptake.fill(cell.traits.uptake);
+            if let Some(r) = metabolism {
+                self.catalysis[r as usize] = 1.0;
+                self.active.push(r);
+            }
+            return;
+        };
+
+        // An unbound genome has no targets, so the zip below yields nothing
+        // and the cell silently does nothing at all -- which is exactly what
+        // the clamped-key bug looked like from the outside, and it took a
+        // four-hundred-second run to notice. Every path that hands a genome to
+        // a cell binds it first; this is here so that a path that forgets says
+        // so immediately.
+        debug_assert_eq!(
+            g.genes.len(),
+            g.targets.len(),
+            "a cell is carrying a genome that was never bound to the chemistry"
+        );
+
+        self.uptake.fill(1.0);
+        for ((gene, targets), &conc) in g.genes.iter().zip(&g.targets).zip(&cell.proteome) {
+            if conc <= 0.0 {
+                continue;
+            }
+            let amount = conc * gene.strength();
+            match gene.class {
+                ProteinClass::Enzyme => {
+                    for &(r, a) in &targets.reactions {
+                        let slot = &mut self.catalysis[r as usize];
+                        if *slot == 0.0 {
+                            self.active.push(r);
+                        }
+                        *slot += amount * a;
+                    }
+                }
+                ProteinClass::Transporter => {
+                    for &(c, a) in &targets.compounds {
+                        self.uptake[c as usize] += amount * a;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.active.sort_unstable();
+    }
+}
+
 /// The two per-compound numbers the cell layer reads in its inner loops.
 ///
 /// A [`Compound`](hadean_chem::Compound) carries a name, an atom graph, two
@@ -809,6 +1223,31 @@ impl CompoundTable {
     }
 }
 
+/// Copy a genome for a daughter and match the copy to the chemistry.
+///
+/// [`genome::replicate`] returns `None` when no operator fired, which at the
+/// default rates is most divisions. That is worth keeping distinct from "the
+/// daughter is identical anyway": when nothing fired the caller shares the
+/// mother's `Arc` and pays for neither the copy nor the decode nor the
+/// rebinding, and a colony of clones costs one genome between all of them.
+/// This function is the path for when something *did* fire.
+fn inherit_genome(
+    parent: &Arc<Genome>,
+    cfg: &CellConfig,
+    chem: &Chemistry,
+    rng: &Counter,
+    tick: u64,
+    id: u64,
+) -> Arc<Genome> {
+    match genome::replicate(parent, &cfg.mutation, rng, tick, id) {
+        Some(mut child) => {
+            child.bind(chem, cfg.enzyme_sigma, cfg.transport_sigma);
+            Arc::new(child)
+        }
+        None => Arc::clone(parent),
+    }
+}
+
 /// Indices into `cells`, ordered by the voxel each one occupies.
 ///
 /// Ties break on index, which is ascending in cell id, so the order is a pure
@@ -829,11 +1268,13 @@ fn cell_volume(radius: f32) -> f64 {
     (4.0 / 3.0 * PI * radius * radius * radius) as f64
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exchange(
     cell: &mut Cell,
     cfg: &CellConfig,
     grid: &Grid,
     table: &CompoundTable,
+    expression: &Expression,
     amounts: &mut ChemField,
     residual: &mut ChemField,
     dt: f64,
@@ -842,8 +1283,11 @@ fn exchange(
     let area = (4.0 * PI * cell.radius * cell.radius) as f64;
     let cell_v = cell_volume(cell.radius);
     let voxel_v = grid.voxel_volume() as f64;
-    let scale = cell.membrane_scale(cfg) * area * dt;
     for c in 0..table.len() {
+        // Per compound now, because a genome cell's membrane is not one
+        // number. Grouped exactly as it was so a cell with a flat profile --
+        // which is every pre-genome cell -- gets the same f64 it always got.
+        let scale = (cfg.membrane_scale as f64 * expression.uptake[c] as f64) * area * dt;
         let outside = amounts.get(c, voxel) as f64;
         let inside = cell.contents[c];
         let gradient = outside / voxel_v - inside / cell_v;
@@ -865,32 +1309,72 @@ fn exchange(
     }
 }
 
+/// Run every reaction this cell has an enzyme for, in id order.
+///
+/// A pre-genome cell has exactly one and this is the Phase 2 function with a
+/// loop of length one around it. A genome cell may have several, and that is
+/// the substantive difference the genome makes: a lineage can hold two enzymes
+/// and run a *pathway*, feeding one reaction's product into the next, which no
+/// amount of tuning could give the hardcoded protocell.
+///
+/// Direction is decided by the reaction's own enthalpy, not by which way it
+/// was written down: an enzyme runs its reaction downhill, because there is no
+/// other direction to get energy from. Free energy cannot be manufactured here
+/// for the same structural reason it cannot be anywhere else in this project --
+/// what the cell banks is the *measured* fall in the chemical energy of its
+/// own contents, and that is a difference of state functions.
+///
+/// What this does not model is equilibrium. The extent is a fraction of the
+/// limiting substrate with no reverse flux, so a catalysed reaction runs to
+/// completion rather than to its equilibrium position. That is inherited from
+/// the pre-genome cell and is the largest simplification in the metabolism.
+#[allow(clippy::too_many_arguments)]
 fn metabolize(
     cell: &mut Cell,
     cfg: &CellConfig,
     grid: &Grid,
-    reaction: &Reaction,
+    chem: &Chemistry,
+    expression: &Expression,
     table: &CompoundTable,
     heat: &mut HeatField,
     dt: f64,
 ) {
-    let fraction = 1.0 - (-cfg.metabolic_rate as f64 * dt).exp();
-    let mut extent = f64::INFINITY;
-    for &(c, n) in &reaction.reactants {
-        extent = extent.min(cell.contents[c as usize] / n as f64);
+    let before = table.energy_of(&cell.contents);
+    let mut ran = false;
+
+    for &id in &expression.active {
+        let reaction = chem.reaction(id);
+        // Downhill, whichever way that is.
+        let (from, to) = if reaction.dh < 0.0 {
+            (&reaction.reactants, &reaction.products)
+        } else {
+            (&reaction.products, &reaction.reactants)
+        };
+
+        let rate = cfg.metabolic_rate as f64 * expression.catalysis[id as usize] as f64;
+        let fraction = 1.0 - (-rate * dt).exp();
+        let mut extent = f64::INFINITY;
+        for &(c, n) in from {
+            extent = extent.min(cell.contents[c as usize] / n as f64);
+        }
+        extent *= fraction;
+        if !extent.is_finite() || extent <= 0.0 {
+            continue;
+        }
+
+        for &(c, n) in from {
+            cell.contents[c as usize] -= extent * n as f64;
+        }
+        for &(c, n) in to {
+            cell.contents[c as usize] += extent * n as f64;
+        }
+        ran = true;
     }
-    extent *= fraction;
-    if !extent.is_finite() || extent <= 0.0 {
+
+    if !ran {
         return;
     }
 
-    let before = table.energy_of(&cell.contents);
-    for &(c, n) in &reaction.reactants {
-        cell.contents[c as usize] -= extent * n as f64;
-    }
-    for &(c, n) in &reaction.products {
-        cell.contents[c as usize] += extent * n as f64;
-    }
     let after = table.energy_of(&cell.contents);
     let released = (before - after).max(0.0);
     let desired_heat = released * (1.0 - cfg.capture_efficiency as f64);
@@ -898,6 +1382,64 @@ fn metabolize(
     // Whatever did not actually land as heat remains stored. This includes
     // normal heat-deposit rounding, keeping the audit exact at the boundary.
     cell.reserve += released - landed;
+}
+
+/// Advance one cell's proteome.
+///
+/// Concentration relaxes towards the gene's transcription level at the
+/// protein's own turnover rate: `dc/dt = stability (level - c)`. Two things
+/// fall out of writing it that way rather than as separate synthesis and decay
+/// terms. Concentration is bounded in `0..1` by construction, so no mutation
+/// can produce a cell holding a thousandfold of anything; and `stability`
+/// means one thing -- how fast this protein tracks its gene -- rather than
+/// being half of a ratio that sets the steady state.
+///
+/// The regulatory sum is what makes this a *network* and not a lookup: a gene
+/// with binding sites is driven by whatever regulator proteins are present,
+/// and regulators are themselves gene products. So a mutation in one gene's
+/// key can retune the expression of every gene whose promoter it now
+/// recognises, which is the mechanism L5 differentiation will need.
+///
+/// Stepped every tick rather than on `schedule.expression`. At a few genes per
+/// cell it costs less than the staggering would, and the schedule exists to
+/// save work, not to be obeyed.
+/// `scratch` holds the transcription levels while they are computed. It is a
+/// parameter rather than a local because the regulatory network has to be read
+/// off the proteome the cell had at the *start* of the step, not off one that
+/// is half updated -- otherwise a gene's own product feeds back into its own
+/// level within a single tick -- and because a population of a few hundred
+/// would otherwise allocate a vector per cell per tick.
+fn transcribe(cell: &mut Cell, scratch: &mut Vec<f32>, dt: f64) {
+    let Some(g) = cell.genome.as_ref() else {
+        return;
+    };
+    let n = g.genes.len();
+    if n == 0 {
+        cell.proteome.clear();
+        return;
+    }
+    scratch.clear();
+    scratch.reserve(n);
+    for (gene, targets) in g.genes.iter().zip(&g.targets) {
+        let mut drive = gene.basal;
+        for (site, bound_by) in gene.sites.iter().zip(&targets.sites) {
+            let mut bound = 0.0;
+            for &(j, a) in bound_by {
+                bound += cell.proteome.get(j).copied().unwrap_or(0.0) * a;
+            }
+            drive += site.weight * bound.min(1.0);
+        }
+        scratch.push(drive.clamp(0.0, 1.0));
+    }
+
+    // A daughter whose genome mutated has a proteome the wrong length; she
+    // starts her new genes from nothing and expresses them up.
+    if cell.proteome.len() != n {
+        cell.proteome.resize(n, 0.0);
+    }
+    for (i, c) in cell.proteome.iter_mut().enumerate() {
+        *c += g.genes[i].stability * (scratch[i] - *c) * dt as f32;
+    }
 }
 
 /// Pay for staying alive, and shut down rather than starve if that fails.
@@ -928,15 +1470,19 @@ fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField
         working
     };
 
+    // What a cell can endure unpaid. Constant before genomes; for a genome
+    // cell it is what its structural protein bought, and that is a real trade
+    // because the same protein is on the bill above.
+    let tolerance = cell.famine_tolerance(cfg);
     if cell.reserve >= due {
         let landed = heat.deposit(grid, cell.voxel(grid), due);
         cell.reserve -= landed;
-        cell.damage = (cell.damage - dt as f32 / cfg.starvation_time).max(0.0);
+        cell.damage = (cell.damage - dt as f32 / tolerance).max(0.0);
     } else {
         // Below even the dormant bill there is nothing left to cut, and
         // `starvation_time` measures what it always did: how long a cell that
         // cannot pay at all takes to die of it.
-        cell.damage += dt as f32 / cfg.starvation_time;
+        cell.damage += dt as f32 / tolerance;
     }
 
     // Waking is a much higher bar than shutting down was. Without the gap a
@@ -968,9 +1514,11 @@ fn growth_radius(cfg: &CellConfig, reserve: Joules) -> f32 {
     cfg.birth_radius * (1.0 + (2.0f32.cbrt() - 1.0) * progress)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn divide(
     parent: &mut Cell,
     cfg: &CellConfig,
+    chem: &Chemistry,
     grid: &Grid,
     rng: &Counter,
     tick: u64,
@@ -1004,6 +1552,22 @@ fn divide(
     parent.pos[1] -= separation * angle.sin();
     clamp_position(&mut parent.pos, grid, cfg.birth_radius);
 
+    // Replication. A daughter gets her mother's cytoplasm whether or not the
+    // genome changed: a cell divides its protein along with everything else,
+    // and a mutant that had to re-express its whole proteome from nothing
+    // would be handicapped by the fact of having mutated rather than by what
+    // the mutation did. `transcribe` truncates or pads the copy to the
+    // daughter's own gene count, so a point substitution -- which leaves the
+    // gene list the same length and in the same order -- carries across
+    // exactly, and only genuinely new genes start at zero.
+    let (child_genome, child_proteome) = match &parent.genome {
+        None => (None, Vec::new()),
+        Some(mine) => (
+            Some(inherit_genome(mine, cfg, chem, rng, tick, parent.id)),
+            parent.proteome.clone(),
+        ),
+    };
+
     Cell {
         id: child_id,
         parent: Some(parent.id),
@@ -1016,6 +1580,8 @@ fn divide(
         state: CellState::Alive,
         generation: parent.generation + 1,
         traits: parent.traits.inherit(cfg, rng, tick, parent.id),
+        genome: child_genome,
+        proteome: child_proteome,
     }
 }
 
@@ -1163,6 +1729,14 @@ mod tests {
     }
 
     /// Particles of every compound in a field, as `introduce` wants them.
+    /// The [`Expression`] a pre-genome cell reads out. Tests below poke at
+    /// `exchange` directly, and it now wants one.
+    fn flat(chem: &Chemistry, cell: &Cell, metabolism: Option<ReactionId>) -> Expression {
+        let mut e = Expression::new(chem);
+        e.read(cell, metabolism);
+        e
+    }
+
     fn abundance(chem: &Chemistry, amounts: &ChemField) -> Vec<f64> {
         (0..chem.n_compounds())
             .map(|c| amounts.total_of(c))
@@ -1247,11 +1821,13 @@ mod tests {
         let before: f64 = amounts.data.iter().map(|&x| x as f64).sum();
         assert_eq!(residual.data.iter().map(|&x| x as f64).sum::<f64>(), 0.0);
         for cell in &mut p.cells {
+            let e = flat(&chem, cell, p.metabolic_reaction);
             exchange(
                 cell,
                 &cfg,
                 &grid,
                 &CompoundTable::new(&chem),
+                &e,
                 &mut amounts,
                 &mut residual,
                 0.01,
@@ -1296,7 +1872,7 @@ mod tests {
         parent.reserve = cfg.division_reserve;
         let before_contents: f64 = parent.contents.iter().sum();
         let before_reserve = parent.reserve;
-        let child = divide(parent, &cfg, &grid, &rng, 20, 99);
+        let child = divide(parent, &cfg, &chem, &grid, &rng, 20, 99);
         assert_eq!(
             before_contents,
             parent.contents.iter().sum::<f64>() + child.contents.iter().sum::<f64>()
@@ -1535,6 +2111,8 @@ mod tests {
             state: CellState::Alive,
             generation: 0,
             traits: Traits::default(),
+            genome: None,
+            proteome: Vec::new(),
         };
         let dt = 0.01;
         let opening = cell.reserve;
@@ -1625,6 +2203,8 @@ mod tests {
             state: CellState::Alive,
             generation: 0,
             traits: Traits::default(),
+            genome: None,
+            proteome: Vec::new(),
         };
 
         let mut shut_down_at = None;
@@ -1743,7 +2323,7 @@ mod tests {
         parent.reserve = cfg.division_reserve;
 
         let children: Vec<f32> = (0..64)
-            .map(|tick| divide(parent, &cfg, &grid, &rng, tick, 1_000 + tick).traits.uptake)
+            .map(|tick| divide(parent, &cfg, &chem, &grid, &rng, tick, 1_000 + tick).traits.uptake)
             .collect();
 
         let mean = children.iter().sum::<f32>() / children.len() as f32;
@@ -1763,7 +2343,7 @@ mod tests {
         // And no spread is the old world exactly: clones, for ever.
         cfg.trait_spread = 0.0;
         assert_eq!(
-            divide(parent, &cfg, &grid, &rng, 7, 2_000).traits.uptake,
+            divide(parent, &cfg, &chem, &grid, &rng, 7, 2_000).traits.uptake,
             parent.traits.uptake
         );
     }
@@ -1801,7 +2381,7 @@ mod tests {
         for tick in 0..500 {
             // Keep the luckiest of each pair, which is selection at its most
             // ruthless: straight up the gradient every generation.
-            let child = divide(cell, &cfg, &grid, &rng, tick, 3_000 + tick);
+            let child = divide(cell, &cfg, &chem, &grid, &rng, tick, 3_000 + tick);
             if child.traits.uptake > cell.traits.uptake {
                 cell.traits = child.traits;
             }
@@ -1833,7 +2413,8 @@ mod tests {
         p.cells[0].traits.uptake = 0.5;
         p.cells[1].traits.uptake = 2.0;
         for cell in p.cells.iter_mut() {
-            exchange(cell, &cfg, &grid, &table, &mut amounts, &mut residual, 0.01);
+            let e = flat(&chem, cell, None);
+            exchange(cell, &cfg, &grid, &table, &e, &mut amounts, &mut residual, 0.01);
         }
 
         let taken: Vec<f64> = p.cells.iter().map(|c| c.contents.iter().sum()).collect();

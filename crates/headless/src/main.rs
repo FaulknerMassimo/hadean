@@ -60,6 +60,10 @@ enum Command {
         /// Also list the reaction network.
         #[arg(short, long)]
         reactions: bool,
+        /// Report the spread of affinity keys, which is what sets how far a
+        /// mutated enzyme can reach.
+        #[arg(short, long)]
+        keys: bool,
         /// How many entries to list.
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
@@ -127,8 +131,9 @@ fn main() -> anyhow::Result<()> {
         Command::Chem {
             config,
             reactions,
+            keys,
             limit,
-        } => chem(config, reactions, limit),
+        } => chem(config, reactions, keys, limit),
         Command::Verify {
             config,
             ticks,
@@ -359,6 +364,18 @@ fn ecology(
             "only the far tail of the population can fund a daughter, if anything can"
         }
     );
+    if cells.genome {
+        // The budget above uses `trait_spread` for the population's standing
+        // variation, and in a genome world `trait_spread` is not what produces
+        // it -- the mutation operators are, and they produced about a fifth as
+        // much. Said here rather than buried, because acting on the wrong one
+        // of these two numbers cost a whole run.
+        println!(
+            "          the budget above assumes a spread of {:.2}; a genome population's is \
+whatever\n          its mutation operators produce, and is reported against the curve below",
+            cells.trait_spread
+        );
+    }
 
     let mut series = Series::new();
     let began = Instant::now();
@@ -369,6 +386,27 @@ fn ecology(
             series.record(&world, &report);
             if progress > 0 && report.tick % progress == 0 {
                 let food = world.limiting_substrate();
+                if world.config.cells.genome {
+                    let traits = world.cells.trait_summary();
+                    println!(
+                        "  tick {:>10}  t = {:>9.1} s  cells {:>6} ({:>5} dormant)  \
+corpses {:>6}  food {:>10}  genes {:>4.1}  lines {:>4}  diets {:>3}",
+                        report.tick,
+                        world.elapsed(),
+                        world.cells.alive(),
+                        world.cells.dormant(),
+                        world.cells.decomposing(),
+                        if food.is_finite() {
+                            format!("{food:.3e}")
+                        } else {
+                            "-".into()
+                        },
+                        traits.mean_genes,
+                        traits.distinct_genomes,
+                        world.cells.diet().len(),
+                    );
+                    continue;
+                }
                 println!(
                     "  tick {:>10}  t = {:>9.1} s  cells {:>6} ({:>5} dormant)  \
 corpses {:>6}  food {:>10}",
@@ -398,7 +436,35 @@ corpses {:>6}  food {:>10}",
         );
     };
     println!();
-    println!("metabolism  {}", equation(&world.chem, reaction));
+    if world.config.cells.genome {
+        // A genome population does not have "a metabolism": it has whatever
+        // its lineages currently catalyse, which is the point of the layer and
+        // is a list, not a line. The ancestral reaction is still printed
+        // because it is where every one of them started.
+        println!("ancestral   {}", equation(&world.chem, reaction));
+        let diet = world.cells.diet();
+        if diet.is_empty() {
+            println!("diet        -- nothing living");
+        } else {
+            for (id, cells) in &diet {
+                println!(
+                    "diet        {:>4} cells  {}",
+                    cells,
+                    equation(&world.chem, *id)
+                );
+            }
+        }
+        let traits = world.cells.trait_summary();
+        println!(
+            "genomes     {:.1} genes, {:.0} bytes, {} clone lines among {} living",
+            traits.mean_genes,
+            traits.mean_genome_bytes,
+            traits.distinct_genomes,
+            world.cells.alive()
+        );
+    } else {
+        println!("metabolism  {}", equation(&world.chem, reaction));
+    }
     println!(
         "food        {}",
         world
@@ -445,6 +511,23 @@ corpses {:>6}  food {:>10}",
     let uptake: Vec<f64> = alive.iter().map(|r| r.mean_uptake).collect();
     print!("{}", chart("mean uptake trait", &uptake, 72, 5));
 
+    if world.config.cells.genome {
+        // Two curves the pre-genome world cannot draw. Clone lines is the one
+        // to read first: it is the population's standing variation, and a
+        // collapse to one is the freeze arriving by a longer road -- a
+        // population that has become clones again cannot thin from the bottom
+        // while its best cells still divide.
+        println!();
+        let lineages: Vec<f64> = alive.iter().map(|r| r.distinct_genomes as f64).collect();
+        print!("{}", chart("clone lines", &lineages, 72, 5));
+        println!();
+        // And how many different livings are being made in the pond at once.
+        // A second row here is a lineage that found one the ancestor did not
+        // have, which is the whole purpose of the layer.
+        let diets: Vec<f64> = alive.iter().map(|r| r.diet_breadth as f64).collect();
+        print!("{}", chart("reactions being eaten", &diets, 72, 5));
+    }
+
     let curve = curve_of(&world, &series);
     println!();
     println!("population curve");
@@ -472,6 +555,43 @@ corpses {:>6}  food {:>10}",
         curve.substrate_drawdown, curve.substrate_rebound
     );
     let traits = world.cells.trait_summary();
+    if world.config.cells.genome {
+        // The same check as the pre-run line, against the variation the
+        // population actually carried rather than the variation the config
+        // hoped for.
+        //
+        // Read at the peak, not at the finish. A run that ends extinct ends
+        // with no variation at all, and a budget computed from that says only
+        // that everything is dead. The peak is where the population had
+        // settled into the pond and where the question -- can anything here
+        // still afford a daughter? -- is the one that decides the rest of the
+        // run.
+        let cells = &world.config.cells;
+        let at_peak = series
+            .rows
+            .iter()
+            .min_by_key(|r| r.tick.abs_diff(curve.peak.tick))
+            .map(|r| {
+                if r.mean_uptake > 0.0 {
+                    r.uptake_spread / r.mean_uptake
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or_else(|| traits.relative_spread());
+        let measured =
+            cells.maintenance_power * (1.0 - cells.trait_cost) * at_peak * cells.maximum_age as f64;
+        println!(
+            "  turnover      {:>10.2e} J budget at the peak's spread of {:.3} -- {}",
+            measured,
+            at_peak,
+            if cells.division_reserve <= measured {
+                "a cell above the margin could fund a daughter"
+            } else {
+                "nothing at the margin could fund a daughter"
+            }
+        );
+    }
     println!(
         "  uptake trait  {:>10.3}  mean, spread {:.3}",
         traits.mean_uptake, traits.uptake_spread
@@ -493,7 +613,159 @@ corpses {:>6}  food {:>10}",
     }
 }
 
-fn chem(config: Option<PathBuf>, reactions: bool, limit: usize) -> anyhow::Result<()> {
+/// How far apart the chemistry's affinity keys are, and what that means for
+/// the genome's recognition widths.
+///
+/// `enzyme_sigma` decides what a mutated enzyme can reach and there is no way
+/// to pick it by taste. Set it far below the distance from one reaction to its
+/// nearest neighbour and every reaction is an island: the ancestor catalyses
+/// its own and no accessible mutation reaches a second. Set it far above the
+/// spread of the whole network and one enzyme catalyses everything at once,
+/// which is not a metabolism.
+///
+/// So the number to print is the distribution of nearest-neighbour distances
+/// in key space, and the number to choose sits inside it: large enough that a
+/// reaction's neighbours are reachable, small enough that the far side of the
+/// network is not. The line at the bottom reports what the configured widths
+/// actually buy, in reactions per enzyme, which is the quantity that matters.
+fn report_keys(chem: &hadean_chem::Chemistry, cfg: &hadean_cell::CellConfig) {
+    fn distance(a: &[f32; 8], b: &[f32; 8]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    // Normalised space, which is where the genome's keys live and therefore
+    // where a recognition width means anything. See `genome::KeyScale`.
+    let scale = hadean_cell::genome::KeyScale::of(chem);
+    let thermal: Vec<[f32; 8]> = chem
+        .reactions
+        .iter()
+        .filter(|r| r.drive == Drive::Thermal && r.dh != 0.0)
+        .map(|r| scale.normalise(&r.key))
+        .collect();
+    if thermal.len() < 2 {
+        return;
+    }
+
+    let mut nearest: Vec<f32> = Vec::with_capacity(thermal.len());
+    for (i, r) in thermal.iter().enumerate() {
+        let mut best = f32::INFINITY;
+        for (j, other) in thermal.iter().enumerate() {
+            if i != j {
+                best = best.min(distance(r, other));
+            }
+        }
+        nearest.push(best);
+    }
+    nearest.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let quantile = |q: f32| nearest[((nearest.len() - 1) as f32 * q) as usize];
+
+    // What the configured width actually reaches, averaged over the network.
+    let reach = |sigma: f32| -> f64 {
+        let floor = 0.01f32;
+        let mut total = 0usize;
+        for r in &thermal {
+            for other in &thermal {
+                let d = distance(r, other);
+                if (-d * d / (sigma * sigma)).exp() >= floor {
+                    total += 1;
+                }
+            }
+        }
+        total as f64 / thermal.len() as f64
+    };
+
+    let compounds: Vec<[f32; 8]> = chem
+        .compounds
+        .iter()
+        .map(|c| scale.normalise(&c.key))
+        .collect();
+    let mut compound_nearest: Vec<f32> = Vec::with_capacity(compounds.len());
+    for (i, c) in compounds.iter().enumerate() {
+        let mut best = f32::INFINITY;
+        for (j, other) in compounds.iter().enumerate() {
+            if i != j {
+                best = best.min(distance(c, other));
+            }
+        }
+        compound_nearest.push(best);
+    }
+    compound_nearest.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let compound_reach = |sigma: f32| -> f64 {
+        let mut total = 0usize;
+        for c in &compounds {
+            for other in &compounds {
+                let d = distance(c, other);
+                if (-d * d / (sigma * sigma)).exp() >= 0.01 {
+                    total += 1;
+                }
+            }
+        }
+        total as f64 / compounds.len() as f64
+    };
+
+    println!();
+    println!("affinity keys ({} thermal reactions):", thermal.len());
+    println!(
+        "  nearest neighbour   min {:.3}  p25 {:.3}  median {:.3}  p75 {:.3}  max {:.3}",
+        nearest[0],
+        quantile(0.25),
+        quantile(0.5),
+        quantile(0.75),
+        nearest[nearest.len() - 1]
+    );
+    for sigma in [0.05f32, 0.08, 0.12, 0.2, 0.35] {
+        println!(
+            "  sigma {:>4}          an enzyme reaches {:>6.1} reactions{}",
+            sigma,
+            reach(sigma),
+            if (sigma - cfg.enzyme_sigma).abs() < 1.0e-6 {
+                "   <- configured"
+            } else {
+                ""
+            }
+        );
+    }
+    println!();
+    println!("             ({} compounds):", chem.compounds.len());
+    println!(
+        "  nearest neighbour   min {:.3}  median {:.3}  max {:.3}",
+        compound_nearest[0],
+        compound_nearest[compound_nearest.len() / 2],
+        compound_nearest[compound_nearest.len() - 1]
+    );
+    for sigma in [0.05f32, 0.08, 0.12, 0.2, 0.35] {
+        println!(
+            "  sigma {:>4}          a transporter reaches {:>4.1} compounds{}",
+            sigma,
+            compound_reach(sigma),
+            if (sigma - cfg.transport_sigma).abs() < 1.0e-6 {
+                "   <- configured"
+            } else {
+                ""
+            }
+        );
+    }
+    println!();
+    println!(
+        "  a point mutation moves one key component by {:.4}, so a lineage walks",
+        1.0 / 255.0
+    );
+    println!("  the median nearest-neighbour gap in about {} substitutions -- which is",
+        (compound_nearest[compound_nearest.len() / 2] / (1.0 / 255.0)).ceil() as u32);
+    println!("  how an enzyme reaches a reaction its width does not already cover.");
+}
+
+fn chem(
+    config: Option<PathBuf>,
+    reactions: bool,
+    keys: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let cell_cfg = load_config(config.clone())?.cells;
     let config = load_config(config)?;
     let chem = hadean_chem::generate(config.seed, config.chemistry);
     chem.verify()
@@ -533,6 +805,10 @@ fn chem(config: Option<PathBuf>, reactions: bool, limit: usize) -> anyhow::Resul
     }
     if chem.n_compounds() > limit {
         println!("... and {} more", chem.n_compounds() - limit);
+    }
+
+    if keys {
+        report_keys(&chem, &cell_cfg);
     }
 
     println!();

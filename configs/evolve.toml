@@ -1,0 +1,174 @@
+# The genome world: `gate.toml`, with L3 switched on.
+#
+# Physically this is the gate pond -- same seed, same chemistry, same sun, same
+# vents, same grid. The only difference is in `[cells]`, and a test enforces
+# that. What changes is where a cell's numbers come from.
+#
+#     hadean ecology --config configs/evolve.toml --ticks 250000
+#
+# The pre-genome protocell has one heritable number and every cell in the pond
+# catalyses the same reaction, chosen once at introduction and fixed for the
+# run. That is the deep reason the population mines its pond to nothing: the
+# food is CH2O2S, made photochemically from CO2, and CO2 takes part in exactly
+# one reaction in this chemistry. Every turnover retires a carbon into CH2OS
+# and nothing brings it back. No dial in `[cells]` reaches that, because the
+# problem is not how well the cells eat, it is that they can only eat one thing
+# and that thing runs out.
+#
+# A genome is not a better dial. It removes the "one thing".
+#
+#   genome = true            A cell's diet is now an enzyme, and an enzyme is
+#                            eight bytes of key matched against the reaction
+#                            network. Two cells with different bytes eat
+#                            differently, a daughter's bytes differ from her
+#                            mother's, and the pond selects. Nothing chooses a
+#                            metabolism for the population any more; the
+#                            ancestor is handed one and its descendants are
+#                            not.
+#
+#                            The route out of the carbon dead end exists and is
+#                            downhill -- O2 + CH2OS -> CH2O3S, then
+#                            H2 + CH2O3S -> H2O + CH2O2S -- and it is unused
+#                            because the first step's rate constant is 8e-15 at
+#                            20 C. That is what an enzyme is *for*: it lowers a
+#                            barrier. A lineage that evolves onto it is a
+#                            decomposer, and a pond with a decomposer in it
+#                            recycles its carbon instead of retiring it. This
+#                            is the mechanism the run is being asked to find.
+#                            It is not guaranteed to find it.
+#
+#   enzyme_sigma = 0.08      How wide a protein's recognition is, measured
+#   transport_sigma = 0.15   rather than chosen: `hadean chem --keys` reports
+#                            the nearest-neighbour spread of the reaction and
+#                            compound keys in the space the genome matches in,
+#                            and on this chemistry the medians are 0.102 and
+#                            0.229. These put about 4.6 reactions and 3
+#                            compounds inside one protein's reach -- a
+#                            specialist with enough promiscuity for a
+#                            duplicate to have somewhere to drift to. 0.2 would
+#                            put 39 of the 78 thermal reactions in reach of one
+#                            enzyme, which is not a metabolism.
+#
+#                            The first attempt did not measure and did not
+#                            survive contact. Key bytes were mapped onto a
+#                            fixed [-2, 2], on the reasoning that structural
+#                            keys are tanh-squashed ratios. Seven of the eight
+#                            components are. The eighth is enthalpy per atom
+#                            and runs to -9.04, so every ancestor's enzyme was
+#                            clamped seven units away from its own reaction,
+#                            and sixteen founders sat in a full pond eating
+#                            nothing while every unit test passed. Keys are
+#                            normalised against the chemistry now, and the
+#                            test that would have caught it is
+#                            `the_ancestor_catalyses_the_reaction_it_was_written_for`.
+#
+#   mutation rates           `PLAN.md`'s table. Duplication is the one that
+#                            matters and it is deliberately as likely as
+#                            deletion: a lineage that cannot grow a second
+#                            enzyme cannot build a pathway, and a pathway is
+#                            the only way anything here eats its own waste.
+#
+# The control for every claim this preset makes is `gate.toml`, which is the
+# same world with `genome = false`, and the control for evolution itself is
+# this file with every mutation rate at zero -- a clone line carrying a genome,
+# which isolates what the genome's *machinery* costs from what its *mutation*
+# buys.
+#
+# Lifecycle numbers are carried over from `gate.toml` and should be treated as
+# provisional. They were measured against the pre-genome cell eating one
+# reaction; a genome cell's membrane is `1 + transporters` rather than one
+# number, so it takes up its food about twice as fast at the same
+# `membrane_scale`, and anything that turns on the break-even concentration has
+# moved.
+
+name = "evolve"
+seed = 1
+dt = 0.01
+
+[grid]
+nx = 24
+ny = 24
+nz = 10
+dx = 2.5e-5
+
+[schedule]
+physics = 1
+chemistry = 1
+transport = 1
+neural = 1
+expression = 10
+growth = 20
+development = 50
+phylogeny = 500
+audit = 100
+
+[chemistry]
+n_compounds = 32
+n_reactions = 240
+max_skeleton = 4
+ea_min_zj = 6.0
+ea_max_zj = 160.0
+rate_min = 0.1
+rate_max = 10000.0
+addition_fraction = 0.3
+absorption_scale = 4000.0
+photo_yield = 0.35
+n_photo = 2
+
+[light]
+irradiance = [40.0, 70.0, 95.0, 110.0, 105.0, 85.0, 55.0, 30.0]
+medium_extinction = [220.0, 260.0, 300.0, 350.0, 420.0, 520.0, 650.0, 820.0]
+day_length = 600.0
+
+[heat]
+ambient = 293.15
+sky = 289.15
+surface_transfer = 60.0
+vent_power = 2.0e-9
+vents = 3
+
+[flow]
+speed = 2.0e-5
+rolls = 2
+
+[vents]
+fuel_rate = 4.0e9
+fuel_species = 2
+
+[initial]
+water = 2.0e11
+primordial = 2.0e9
+noise = 0.25
+
+[cells]
+enabled = true
+initial_count = 16
+population_cap = 60000
+birth_radius = 4.0e-6
+membrane_scale = 1000.0
+metabolic_rate = 20.0
+capture_efficiency = 0.6
+maintenance_power = 1.0e-11
+division_reserve = 1.0e-8
+starvation_time = 300.0
+maximum_age = 2400.0
+lifespan_spread = 0.4
+trait_spread = 0.5
+trait_cost = 0.5
+dormancy_power_fraction = 0.05
+dormancy_exit = 60.0
+decomposition_rate = 0.8
+seed_delay = 150.0
+
+genome = true
+enzyme_sigma = 0.08
+transport_sigma = 0.15
+structural_benefit = 2.0
+
+[cells.mutation]
+point = 1.0e-3
+indel = 1.0e-5
+duplication = 1.0e-3
+deletion = 1.0e-3
+inversion = 1.0e-5
+genome_duplication = 1.0e-6

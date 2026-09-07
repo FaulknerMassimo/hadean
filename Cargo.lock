@@ -229,6 +229,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hadean-analysis",
+ "hadean-cell",
  "hadean-chem",
  "hadean-core",
  "hadean-fields",

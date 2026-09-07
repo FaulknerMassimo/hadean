@@ -428,12 +428,22 @@ impl World {
         out
     }
 
-    /// The compounds the hardcoded metabolism eats, with what is dissolved in
-    /// the pond right now, as `(name, particles, stoichiometric coefficient)`.
+    /// The compounds the *ancestral* metabolism eats, with what is dissolved
+    /// in the pond right now, as `(name, particles, stoichiometric
+    /// coefficient)`.
     ///
     /// This is the population's food supply. Reading it alongside the cell
     /// count is what turns "the population fell" into "the population ate
     /// itself out of house and home".
+    ///
+    /// In a genome world it is the ancestor's food, not necessarily the
+    /// population's: a lineage that has evolved a different enzyme is eating
+    /// something this does not report. That is a limitation of the column and
+    /// not a bug in it -- a population with several diets does not have "a"
+    /// food supply, and `Population::diet` is what says who is eating what.
+    /// The two read together are the interesting picture: the ancestral
+    /// substrate collapsing while the population holds up means something in
+    /// the pond has moved off it.
     pub fn metabolic_substrates(&self) -> Vec<(String, f64, u8)> {
         let Some(id) = self.cells.metabolic_reaction else {
             return Vec::new();
