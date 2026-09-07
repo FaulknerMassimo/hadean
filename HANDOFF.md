@@ -147,17 +147,28 @@ pathway, pays continuous maintenance, moves with flow plus Brownian motion, and
 divides after accumulating enough reserve. Age or starvation kills it;
 decomposition returns its compounds and reserve to the fields.
 
-A cell that cannot pay its upkeep enters `CellState::Dormant` rather than
-running up damage against a reserve it does not have: it drops to
+A **pre-genome** cell that cannot pay its upkeep enters `CellState::Dormant`
+rather than running up damage against a reserve it does not have: it drops to
 `dormancy_power_fraction` of its bill and does not divide, but keeps its
 membrane and its catalyst, because passive diffusion and a catalyst already
 built are not decisions a cell gets to make. It wakes once it has banked
 `dormancy_exit` seconds of working upkeep, a deliberately higher bar than
 shutting down was -- without the gap a cell on the margin flickers every tick
-and averages back into having no dormancy at all. Dormant cells count as alive
-everywhere: in `alive()`, in the safety cap, and in the population column, with
-a separate `dormant` column beside it because a cohort sitting out a night and
-one working through it draw the same line.
+and averages back into having no dormancy at all.
+
+A **genome** cell does none of that. It arrives at `maintain` with a quiescence
+*depth* on 0..1 that its own network chose, and `maintain` bills it; there is
+no threshold, no hysteresis dial and no floor under a cell that decides badly.
+`CellState::Dormant` survives only as a label applied to a cell more than half
+shut down, so the counters and the snapshot keep meaning what they meant. See
+"L6: the decision layer" below.
+
+Dormant cells count as alive everywhere: in `alive()`, in the safety cap, and
+in the population column, with a separate `dormant` column beside it because a
+cohort sitting out a night and one working through it draw the same line. The
+CSV also carries `mean_quiescence`, which is what the dormant count is a
+threshold on: a pond at a mean depth of 0.95 and one at 0.55 report the same
+dormant count and are not the same pond.
 
 Lifespans are per cell. `lifespan()` draws on `Purpose::Death` as a pure
 function of the cell's id, so a cell's allotted span is settled at birth,
@@ -181,7 +192,21 @@ for is to carry inheritance, mutation and selection through the tick, the
 audit, the digest and the snapshot now, so that L3 replaces a mechanism that
 already works rather than introducing one. It is also *state*: unlike a
 lifespan, a cell's traits are its ancestry and cannot be re-derived from its
-id, so they are written into snapshots and the snapshot format is at 4.
+id, so they are written into snapshots. The snapshot format is at **6**: 5
+added the genome bytes and the proteome, 6 adds the network's activations,
+which are per-cell state for the same reason the proteome is -- two sisters
+carrying identical bytes carry neither identical protein nor identical
+opinions. `Cell::quiesce` is deliberately *not* in it, or in the digest: it is
+a readout recomputed at the top of every tick, and writing it down would be a
+second copy of something already there.
+
+`neural.rs` is the interpreter for `Receptor`, `Neural` and `Effector`, and it
+is where every decision a genome cell makes is taken. `sense_and_think` reads
+the receptors and advances the neurons; `Expression::read` runs the effectors
+and hands `exchange`, `move_cell`, `maintain` and the division check what they
+decided. `Sensorium` is the part of the world a receptor can see that the cell
+layer does not already hold -- light, today -- and `Sensorium::dark()` is the
+honest answer for a test that has no sun. See "L6: the decision layer".
 
 Cells are stepped in **voxel order**, not birth order. The order has to be
 fixed, because cells clamp against what the previous cell left in their shared
@@ -911,7 +936,7 @@ transporter to compound, regulator to promoter -- is the same Gaussian on key
 distance, which is what makes the fitness landscape graded rather than a field
 of cliffs.
 
-Four of the eight protein classes act on the world as it stands:
+Seven of the eight protein classes act on the world as it stands:
 
 | class | what it does | where it lands |
 | --- | --- | --- |
@@ -919,13 +944,25 @@ Four of the eight protein classes act on the world as it stands:
 | `Transporter` | raises membrane permeability for compounds near its key | `exchange` |
 | `Structural` | buys famine tolerance, and is charged for it | `maintain` |
 | `Regulator` | binds promoters, so genes regulate genes | `transcribe` |
+| `Receptor` | senses one channel and emits it as a signal | `neural::sense_and_think` |
+| `Neural` | sums its dendrites, squashes, remembers | `neural::sense_and_think` |
+| `Effector` | shuts down, divides, gates a transporter, swims | `neural::drive` |
 
-`Adhesion`, `Receptor`, `Effector` and `Neural` decode, cost upkeep and do
-nothing. They are not placeholders to be replaced -- their class codes are part
-of the genome format, and reserving them means an L5 or L6 genome stays
-readable by this decoder. Until then they are what a nonfunctional protein is
-in a real cell: a bill with nothing on the other side, and therefore selected
-against.
+`Adhesion` decodes, costs upkeep and does nothing. It is not a placeholder to
+be replaced -- its class code is part of the genome format, and reserving it
+means an L5 genome stays readable by this decoder. Until then it is what a
+nonfunctional protein is in a real cell: a bill with nothing on the other side,
+and therefore selected against.
+
+**A gene's sites mean one of two things, and its class byte decides which.** On
+a gene whose protein does chemistry they are promoter binding sites and what
+binds there is a transcription factor. On a `Neural` or `Effector` gene they
+are dendrites and what arrives there is a signal. One structure, two networks,
+and a mutation that flips a class byte moves a gene's inputs from one to the
+other. The cost is that a neuron's own expression cannot be transcriptionally
+regulated -- it runs at its basal level -- and that is the price of not
+extending the byte format, which would have made every genome written before it
+undecodable.
 
 Mutation operators are the plan's table: point substitution, small indel, gene
 duplication, gene deletion, segment inversion, whole-genome duplication, all
@@ -939,7 +976,9 @@ change to this module.
 **The old cell layer is not gone and is not a legacy path.** `cells.genome`
 is a switch, default off, and with it off the arithmetic is *identical* --
 checked, not asserted: a 20000-tick `--csv` of `gate.toml` is byte-for-byte the
-same before and after this work. Everything this project believes about its
+same before and after this work, and was checked again the same way after L6
+went in (every shared column identical; the two new ones are appended, so
+compare with `cut -d, -f1-29`). Everything this project believes about its
 population came out of A/B runs against a control, and a genome that quietly
 replaced the protocell everywhere would have destroyed the control in the same
 commit that needed it most. Both cells produce an `Expression` and nothing
@@ -1236,6 +1275,281 @@ would do the adapting works.
 
 ---
 
+## L6: the decision layer
+
+### The reading that prompted it
+
+Every genome run so far ended the same way, and the CSV said it in one line:
+
+```
+t=326   pop=2088   dormant=2088   food=3.288e10
+t=676   pop=2075   dormant=2075   food=2.059e11     <- food recovered 6x
+t=1176  pop=1888   dormant=1888   food=2.814e03
+```
+
+A hundred per cent dormant, and not one cell wakes even when the night has put
+six times as much food back in the water. That was read here as an overshoot
+problem -- two thousand cells sharing a recovered larder is still less per cell
+than the wake-up bar -- and it is, but that is the symptom rather than the
+disease.
+
+The disease is that **there was no decision in the pond to be wrong**. When to
+shut down and when to wake were two numbers in `CellConfig`, read by every cell
+in the world. A population like that cannot disagree with itself. It shuts down
+at the same instant, it waits for the same bar, and when the bar is
+unreachable it is unreachable for all of them at once -- so there is no
+survivor to select, no variant to be right, and nothing for the genome layer to
+work on. Sixteen founders one division from the ancestor made it worse: four
+distinct lineages out of sixteen, and a standing variation five times *narrower*
+than the single scalar trait the genome had replaced.
+
+That is the same shape as the Phase 2 crash ("What the crash actually was"),
+which was a shared lifespan, and as the freeze that `Traits` was introduced to
+break, which was a shared uptake. Third time: **every time this project has
+found a population dying as one, the cause has been a number that should have
+been per-cell and was per-config.** Dormancy was the last big one.
+
+### What replaced it
+
+`crates/cell/src/neural.rs`. Three of the four remaining protein classes now
+have an interpreter, and there is no path from the world to a cell's behaviour
+that does not go through it:
+
+```
+    receptor ---- signal ----> neuron ---- signal ----> effector
+    (senses)                  (decides)                 (acts)
+```
+
+* A **receptor** reads one [`Channel`] -- food outside, the same compounds
+  inside, its own reserve, its damage, light, heat, crowding, age -- and emits
+  what it finds at its own key. `params[1]` picks the channel; for the two
+  chemical channels the key also picks the compounds, by the same affinity a
+  transporter uses, so a lineage with a transporter for something is most of
+  the way to a sensor for it.
+* A **neuron** sums its dendrites, adds a bias, squashes, and relaxes towards
+  the result at its own `leak` rate. It reads the activations as they stood at
+  the end of the previous tick, so the network is recurrent, may contain
+  cycles, and needs no ordering or acyclicity check.
+* An **effector** does the same sum and drives one [`Action`]: `Quiesce`,
+  `Divide`, `Ingest` (open or close the transporters its key matches), `Move`
+  (swim along an axis, at a cost the audit sees).
+
+Wiring is `affinity` on key distance -- the same function that matches an
+enzyme to a reaction, because there is only one way for two things to be alike
+in this simulation. Which wires exist is resolved once per genome in `bind`;
+what travels down them is per-cell state, which is why two cells carrying
+identical bytes in different corners of the pond behave differently.
+
+### Recurrence is not a shortcut, it is the hysteresis
+
+`dormancy_exit` existed for one reason: a cell on the margin would otherwise
+flicker between shut down and working every tick and average back into paying
+the full bill. That is a memory problem, and the config dial was a shared,
+population-wide answer to it.
+
+A neuron has memory of its own. `Gene::leak` is four bits of `params[3]`,
+logarithmic over 0.1..20 per second, so a time constant anywhere from ten
+seconds to fifty milliseconds. A slow neuron holds an opinion through a
+shortage; a fast one tracks the water. **Sleeping deeply but briefly, lightly
+but long, and everything in between are now things a lineage is rather than
+things a config file is** -- which is the whole of what was asked for, and it
+falls out of one byte rather than out of a new mechanism.
+
+### Sleep has to cost something, and what it costs is the machinery
+
+The first version of `transcribe` scaled every gene's transcription level by
+`activity` -- the fraction of the working bill the cell is currently paying.
+That is the mechanism that stops quiescence being a free lunch. Without it a
+shut-down cell pays five per cent of its upkeep and goes on taking up and
+catalysing at full rate, which is strictly better than staying awake, so the
+only stable strategy is permanent sleep. Which is very nearly what the run
+above shows.
+
+With it, a cell that shuts down stops synthesising, its proteome decays at each
+protein's own `stability`, and within a minute or two it has lost the
+transporters and enzymes it was living on. Cheaper *and* poorer, with a real
+spin-up time on the way back. That is a spore.
+
+**The nervous system is exempt from the throttle, and it took a failing test to
+see why.** Scaling everything closes the arithmetic on itself: shutting down
+decays the receptor that reads the reserve and the effector that acts on it,
+which lowers the depth, which restores them. The ancestor settled at a
+quiescence of 0.471 and could not go deeper however hungry it got -- a cell
+physically unable to commit to sleeping, because the organ it sleeps with was
+the first thing it switched off. Nothing could have woken it either. Receptors,
+neurons and effectors therefore transcribe at their full level whatever the
+depth, which is also what a real spore does, and they stay on the upkeep bill
+through `machinery()` -- so a lineage that evolves a large brain pays for it in
+every famine it sits through.
+
+### The ancestor now has a nervous system, and it is deliberately dull
+
+`genome::ancestor` writes four more genes: a receptor on `Channel::Energy`
+emitting at `hunger`; a neuron listening at `hunger` with weight -4 and bias
++0.6, emitting at `sleep`; a `Quiesce` effector listening at `sleep` with
+weight +4; and a `Divide` effector listening at the same address with weight -4
+and bias +1, so the signal that shuts the cell down also stops it spending a
+reserve on a daughter.
+
+That circuit is *approximately the rule it replaces* -- it shuts down around
+fifty seconds of banked upkeep, which is where `dormancy_exit = 60` put the old
+wake bar. On purpose. The claim being tested is not that a hand-written network
+beats a hand-written threshold; it is that **a network is made of parts that
+mutate**. A weight, a bias, a rate of forgetting, a channel, an action, and
+which effector hears what. Sixteen founders of it are sixteen different
+opinions about when to sleep and how deeply.
+
+`PROTEOME_REFERENCE` moved from 4.0 to 7.0 with it. Four more proteins to keep
+is a third again on the upkeep bill, and leaving it would have quietly charged
+every genome cell for the privilege of being able to decide anything.
+
+### Founders are relatives now, not copies
+
+`founder_divergence` (default 20) runs each founder through that many rounds of
+the *same* mutation operators every division uses. Nothing founder-specific:
+the variation the cohort arrives with is drawn from exactly the distribution
+its descendants will go on exploring, and it places the ancestor some
+generations in the past rather than at t = 0 -- which is the more honest
+picture anyway. Life does not arrive at a pond having just been invented.
+
+The measured effect at t = 200 s on `evolve.toml`, sixteen founders:
+
+| | before | after |
+| --- | --- | --- |
+| distinct lineages | 4 | **16** |
+| genes per cell | 6.1 | 9.9, of which 4.1 signal |
+| dormant at t = 200 s | all or none | **4 of 16, at a mean depth of 0.22** |
+
+The last row is the one that matters and it is the point of the whole change: a
+quarter of the pond has decided to shut down and three quarters have not, in
+the same water, at the same moment. That never happened before, because it
+could not.
+
+### What the run actually did
+
+`evolve.toml`, 250000 ticks, everything as before except the four new genes and
+`founder_divergence = 20`. Against the same file's previous run, which is the
+table under "What the first run actually did":
+
+| | before L6 | with L6 |
+| --- | --- | --- |
+| peak | 141 | **157** at t = 824 s |
+| births | 141 | 161 |
+| deaths | -- | 154 |
+| **births after the peak** | **0** | **0** |
+| clone lines at the peak | 49 | **75** |
+| signal genes per cell | -- | 4.1 rising to **5.14** |
+| reactions eaten | 1 | 1 |
+| finish | extinct | 7 living, extinct trajectory |
+| energy audit | -4.7e-11 | **-3.9e-12** relative |
+
+And the reading the whole change was for, at t = 1539 s:
+
+```
+    pop=156   dormant=78   mean_quiescence=0.453
+```
+
+**Exactly half the pond shut down, in the same water, at the same moment**, at
+a mean depth of 0.45. Before this, every reading of that column was 0% or
+100%. The pond can now disagree with itself about whether to sleep, which is
+the entire mechanism, and the disagreement is heritable.
+
+Two other things in that table are worth reading. The nervous system is *not*
+being shed: signal genes per cell rise from 4.1 to 5.14 as the population is
+culled from 157 to 7, so the cells that survived longest were on average the
+ones carrying more of it -- upkeep with no metabolic return, kept anyway. And
+the energy audit is an order of magnitude *tighter* than the pre-L6 run at
+-3.9e-12 relative, across a layer that added two new ways for a cell to spend
+(a graded upkeep and a motility bill) and a third of a joule's worth of
+protein. Both new spends go through `heat.deposit` and the reserve, like every
+other.
+
+### What it did not do, and why that was predictable
+
+**Still zero births after the peak.** The last division in the run is at
+t = 824 s of 2500, against 839 s before it. Dormancy was not what was stopping
+them, and the run says so in its own summary:
+
+```
+turnover  3.11e-9 J budget at the peak's spread of 0.259
+          -- nothing at the margin could fund a daughter
+```
+
+`division_reserve` is 1e-8 J and the population's measured spread will fund
+3.11e-9. Short by a factor of three, which is item 0 on the outstanding list
+and was item 0 before any of this. A cell that has decided not to sleep still
+cannot afford a daughter it has no surplus for.
+
+So: the dormancy fault is fixed as a *mechanism* and the pond still fails the
+Phase 2 gate, for the reason it was already failing it. Those are two findings
+and they should not be reported as one. What has changed is that the failure is
+now a clean boom and bust -- 157 to 7, 154 deaths -- rather than a population
+freezing at 140 and standing still, and that a population which is dying now
+does so at a range of depths instead of all at once.
+
+### The 4e-10 regime, re-run
+
+The run above is at `division_reserve = 1e-8`. The other end of the dial is the
+one this change was aimed at, because it is where the pond went 100% dormant
+and stayed there. Same file with `division_reserve = 4.0e-10`, which is the
+configuration the table in "It was tried, and buying births does not buy
+generations" was measured on:
+
+| | before L6 | with L6 |
+| --- | --- | --- |
+| peak | 2088 at t = 237 s | 2212 at t = 260 s |
+| births | 2088 | 2215 |
+| **births after the peak** | **0** | **3** |
+| clone lines at the peak | 617 | **867** |
+| uptake spread at the peak | 0.357 | **0.542** |
+| turnover budget | short | **6.50e-9 J: a cell above the margin could fund a daughter** |
+| dormant at t = 250 s | -- | 1414 of 2207 (64%) at depth **0.51** |
+| dormant at t = 326 s | **2088 of 2088 (100%)** | -- |
+| dormant at t = 676 s | **2075 of 2075 (100%)**, food recovered 6x | -- |
+| dormant at t = 750 s | -- | 1857 of 2095 (89%): **238 awake**, food recovered 100x |
+| finish | extinct | 2 living |
+
+Two things in there are new and one is not.
+
+**The sentence that was true of every earlier run at this setting -- "goes 100%
+dormant and never wakes" -- is not true of this one.** At t = 750, with the
+night having put a hundred times as much food back in the water, two hundred
+and thirty eight cells are working through a shortage that has shut the other
+1857 down. Half the pond at t = 250 was awake at a mean depth of 0.51.
+
+**Three births after the peak**, which is a small number and is the first
+non-zero value that column has ever had in this project. The mechanism behind
+it is visible in the row above it: the population's standing variation at the
+peak went from 0.357 to 0.542, which is enough to flip `ecology`'s own pre-run
+check from "nothing at the margin could fund a daughter" to "a cell above the
+margin could". More variation is exactly what `founder_divergence` and a
+heritable dormancy strategy were expected to buy, and the budget line is the
+project's own arithmetic agreeing that they bought it.
+
+**It still ends extinct**, at 2 cells from a peak of 2212, having eaten its
+larder down 15.8x with 0.00x back. That is not dormancy and it is not
+variation. It is item 1: the pond has no renewable living, so a population that
+overshoots has nothing to come back to. Three births is a mechanism working at
+the very bottom of its range, not a carrying capacity.
+
+### What is still hardcoded, and why it is not behaviour
+
+Two lists, and neither is a decision: `Channel`, the things there are to sense,
+and `Action`, the things there are to do. A cell has a membrane so there is
+something to taste through; it can shut down, divide, open a transporter and
+swim, so there are four things an effector can be wired to. Which channel a
+receptor watches and which action an effector drives are `params[1]` of the
+gene -- genetic, mutable, selected on. The lists are the cell's *physiology*,
+and a genome that could invent an organ the cell does not have would not be a
+genome.
+
+The variant order of both is part of the genome format for the same reason
+`ProteinClass`'s discriminants are: a gene picks by quantising a byte, so
+inserting a variant in the middle re-points every receptor in every stored
+genome. **Append only.**
+
+---
+
 ## What is left
 
 ### Immediately outstanding
@@ -1244,12 +1558,25 @@ would do the adapting works.
    state.** Every mutation rate in the table is per-division, so a population
    that stops dividing has switched the whole layer off -- and on seed 1 it
    always stops. At `division_reserve = 1e-8` the plateau has no births in it;
-   at 4e-10 it overshoots into total dormancy and has no waking cells in it.
-   Both give exactly one generation, for the same underlying reason: births
-   balancing deaths is what a carrying capacity *is*, and this pond does not
-   have one. This is item 1 wearing a different hat, and it is why item 1 is
-   still item 1. See "It was tried, and buying births does not buy
-   generations".
+   at 4e-10 it overshoots and has no waking cells in it. Both give exactly one
+   generation, for the same underlying reason: births balancing deaths is what
+   a carrying capacity *is*, and this pond does not have one. This is item 1
+   wearing a different hat, and it is why item 1 is still item 1. See "It was
+   tried, and buying births does not buy generations".
+
+   **Half of that diagnosis has since been dealt with and half has not.** The
+   4e-10 end failed because dormancy was one rule for the whole pond, so the
+   plateau shut down as one unit and the wake bar was unreachable for all of it
+   at once; that is gone, and the L6 section has the measurement. The 1e-8 end
+   is untouched and is the live blocker: at the population's measured spread of
+   0.259 the turnover budget is 3.11e-9 J against a `division_reserve` of 1e-8,
+   so no cell at the margin can fund a daughter whatever it decides about
+   sleeping. The 4e-10 end now produces three births after the peak against a
+   previous zero, and a standing variation of 0.542 against 0.357 -- enough to
+   clear its own turnover budget -- so **the sweep between the two ends is now
+   the single most informative run available** and should be the next thing
+   done. It was already called for; what changed is that one end of it has
+   stopped failing for the reason that used to mask everything else.
 1. **Give the population a renewable living.** Still the one that matters, and
    still not in `CellConfig`. The genome makes a renewable living *reachable*
    -- a lineage that evolves onto the waste-recycling reaction closes the
@@ -1283,12 +1610,38 @@ would do the adapting works.
 5. `Traits` holds one field and is now the pre-genome path only. It is kept
    because it is the control, not because it is expected to grow: a trait to
    add belongs in a protein class.
+5b. **The L6 dials have not been measured.** `swim_speed` and `motility_power`
+   are reasoned from the pond's flow speed and a cell's upkeep, not measured
+   against a run, and no lineage has yet been observed to keep a motility gene.
+   `Channel::Heat` maps 0..100 C onto 0..1, which is most of the byte range
+   spent on temperatures this pond never reaches. `Channel::Crowd` saturates at
+   eight cells to a voxel, which was picked to be the order of a crowded voxel
+   and not measured. None of these are wrong in a way that would show up as a
+   bug; they are wrong in the way an unmeasured dial always is.
+
+   One consequence of the transcription throttle was not designed for and is
+   worth knowing about: `Structural` is not a signal class, so it decays under
+   quiescence like the rest of the metabolism, and a deeply shut-down cell
+   therefore has *less* famine tolerance than a working one. A spore ought to
+   be tougher. It is second-order -- quiescence lowers the bill by up to twenty
+   times, so a shut-down cell rarely reaches the branch where tolerance is
+   consulted at all -- but if a run shows deep sleepers dying faster than
+   shallow ones, this is where to look first.
 6. **The lifecycle numbers have not been re-measured for a genome cell**, and
    should not be trusted on `evolve.toml`. A genome cell's membrane is
    `1 + transporters` rather than one flat multiplier, so at the same
    `membrane_scale` it takes up its food roughly twice as fast, and everything
    that turns on the break-even concentration has moved. The dials' meanings
    hold; their values were measured against a different cell.
+6b. **`Action::Ingest` has almost no gradient to climb in this world.** An
+   effector that closes a transporter is a real mechanism and it works, but
+   nothing in the pond is *harmful* to take up: contents that are not
+   metabolised simply sit there, and upkeep is charged on standing protein
+   rather than on what is inside the cell. So closing a membrane against
+   something saves nothing and selection cannot see it. The gate is worth
+   having because it is what "that does not taste good" has to be made of, and
+   it will start to matter the moment a compound can hurt -- which is a change
+   to the chemistry, not to `neural.rs`.
 7. **Horizontal gene transfer is not implemented** and is the largest missing
    piece of `PLAN.md`'s L3. It needs a lysing cell's genome to enter the voxel
    as a compound-like entity, which is a change to the mass audit rather than

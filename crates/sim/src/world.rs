@@ -184,6 +184,12 @@ impl World {
             );
         }
 
+        // What a receptor can see of the world beyond the cell layer's own
+        // fields. Light only, so far.
+        let sensorium = hadean_cell::Sensorium {
+            light: Some(&self.light),
+            full_sun: self.config.light.total_irradiance(),
+        };
         self.cells.step(
             &self.config.cells,
             &self.grid,
@@ -192,7 +198,8 @@ impl World {
             &self.rng,
             self.clock.tick,
             dt,
-            self.config.schedule.growth,
+            &self.config.schedule,
+            &sensorium,
             &mut self.amounts,
             &mut self.residual,
             &mut self.heat,

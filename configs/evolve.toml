@@ -165,6 +165,44 @@ enzyme_sigma = 0.08
 transport_sigma = 0.15
 structural_benefit = 2.0
 
+# L6. What a cell does is now a network its own genome specifies, and these
+# are the only numbers left outside it.
+#
+#   founder_divergence       How far back the hand-written ancestor sits. The
+#                            founding cohort used to be one division from it,
+#                            which at these rates leaves half of them
+#                            byte-identical -- four distinct lineages out of
+#                            sixteen founders in the first genome run, and a
+#                            standing variation five times narrower than the
+#                            single scalar trait the genome replaced. Twenty
+#                            rounds of the same operators every division uses
+#                            gives sixteen genuinely different relatives, drawn
+#                            from exactly the distribution their descendants
+#                            will go on exploring.
+#
+#   swim_speed               A flagellum, and its bill. Set against
+#   motility_power           `flow.speed = 2e-5`: a cell that can swim at the
+#                            speed of the convection roll can hold a depth
+#                            instead of being carried through the light
+#                            gradient, and one that cannot is a passenger. The
+#                            power is a fifth of `maintenance_power` at full
+#                            thrust and quadratic in speed, so half speed is a
+#                            twentieth of it -- swimming has to cost something
+#                            or every lineage evolves a flagellum and the trait
+#                            says nothing.
+#
+# What is *not* here any more is the dormancy decision. `dormancy_exit` above
+# is read only by the pre-genome control; a genome cell shuts down when its own
+# receptor, neuron and effector say so, at a depth on 0..1 rather than in one
+# of two states, and the hysteresis that dial provided comes instead from a
+# neuron's rate of forgetting -- four bits of that cell's own genome. Sixteen
+# founders are sixteen opinions about when to sleep and how deeply, which is
+# the difference between a pond that shuts down as one and a pond that has
+# something for selection to act on.
+founder_divergence = 20
+swim_speed = 2.0e-5
+motility_power = 2.0e-12
+
 [cells.mutation]
 point = 1.0e-3
 indel = 1.0e-5

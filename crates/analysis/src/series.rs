@@ -74,6 +74,20 @@ pub struct Row {
     /// variation to ask the question with -- and a population of clones is
     /// exactly the freeze this trait exists to break.
     pub uptake_spread: f64,
+    /// Mean quiescence depth across the living, 0..1.
+    ///
+    /// `dormant` above counts cells past a reporting threshold; this is the
+    /// quantity that threshold was applied to, and the two are worth reading
+    /// together. A pond at a mean depth of 0.95 has committed to sitting the
+    /// famine out. One at 0.55 with the same dormant count is a population
+    /// that disagrees with itself, and disagreement is what selection needs.
+    pub mean_quiescence: f64,
+    /// Mean receptors, neurons and effectors per living cell.
+    ///
+    /// Nervous system as upkeep with no metabolic return. If this shrinks
+    /// monotonically the pond is telling you that deciding anything does not
+    /// pay in it, which is a finding rather than a bug.
+    pub mean_signal_genes: f64,
 }
 
 impl Row {
@@ -81,7 +95,8 @@ impl Row {
 drift_j,relative_drift,mass_drift,light_in_j,radiated_out_j,vent_heat_in_j,\
 mean_temperature_k,surface_temperature_k,floor_temperature_k,surface_light_w_m2,\
 population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles,\
-mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_breadth";
+mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_breadth,\
+mean_quiescence,mean_signal_genes";
 
     /// Take a reading from a world and its latest audit.
     pub fn sample(world: &World, report: &AuditReport) -> Self {
@@ -118,12 +133,14 @@ mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_bre
             mean_genome_bytes: traits.mean_genome_bytes,
             distinct_genomes: traits.distinct_genomes as u64,
             diet_breadth: world.cells.diet().len() as u64,
+            mean_quiescence: traits.mean_quiescence,
+            mean_signal_genes: traits.mean_signal_genes,
         }
     }
 
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6},{:.3},{:.1},{},{}",
+            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6},{:.3},{:.1},{},{},{:.4},{:.3}",
             self.tick,
             self.elapsed,
             self.chemical,
@@ -153,6 +170,8 @@ mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_bre
             self.mean_genome_bytes,
             self.distinct_genomes,
             self.diet_breadth,
+            self.mean_quiescence,
+            self.mean_signal_genes,
         )
     }
 }

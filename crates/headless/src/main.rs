@@ -389,12 +389,14 @@ whatever\n          its mutation operators produce, and is reported against the 
                 if world.config.cells.genome {
                     let traits = world.cells.trait_summary();
                     println!(
-                        "  tick {:>10}  t = {:>9.1} s  cells {:>6} ({:>5} dormant)  \
-corpses {:>6}  food {:>10}  genes {:>4.1}  lines {:>4}  diets {:>3}",
+                        "  tick {:>10}  t = {:>9.1} s  cells {:>6} ({:>5} dormant, \
+depth {:>4.2})  corpses {:>6}  food {:>10}  genes {:>4.1} ({:>3.1} signal)  \
+lines {:>4}  diets {:>3}",
                         report.tick,
                         world.elapsed(),
                         world.cells.alive(),
                         world.cells.dormant(),
+                        traits.mean_quiescence,
                         world.cells.decomposing(),
                         if food.is_finite() {
                             format!("{food:.3e}")
@@ -402,6 +404,7 @@ corpses {:>6}  food {:>10}  genes {:>4.1}  lines {:>4}  diets {:>3}",
                             "-".into()
                         },
                         traits.mean_genes,
+                        traits.mean_signal_genes,
                         traits.distinct_genomes,
                         world.cells.diet().len(),
                     );
@@ -461,6 +464,10 @@ corpses {:>6}  food {:>10}",
             traits.mean_genome_bytes,
             traits.distinct_genomes,
             world.cells.alive()
+        );
+        println!(
+            "nervous     {:.1} signal genes per cell, mean quiescence {:.3}",
+            traits.mean_signal_genes, traits.mean_quiescence
         );
     } else {
         println!("metabolism  {}", equation(&world.chem, reaction));

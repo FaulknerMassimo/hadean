@@ -21,6 +21,12 @@ cell's lifecycle.
   whole-genome duplication act on it at every division
 - L4 protocell: membrane transport, metabolism, maintenance, Brownian motion,
   division, dormancy, individual lifespans, death, decomposition
+- L6 decision layer: receptors that sense the water, the cell's own reserve,
+  light, heat, crowding and age; neurons that sum them, squash and remember;
+  effectors that shut the cell down, hold off a division, open or close a
+  transporter, or swim. Wiring, weights, biases and time constants are all in
+  the genome, so *nothing* about what a cell does is written in the cell layer
+  any more — only the interpreter that reads it
 - Headless CLI, compressed snapshots, replay verification, CSV telemetry
 - Population-curve analysis: boom, bust and recovery read out of a run rather
   than asserted
@@ -76,6 +82,35 @@ that was already the outstanding problem. What the runs do show is that the
 machinery works under load — 617 lineages against a clone control's 1, standing
 variation of 0.357 against exactly 0.000, and an energy audit flat to 5e-11
 across two thousand cells.
+
+The dormant half of that was its own problem and has been fixed at the root,
+which the runs now show and which did not, on its own, unblock the gate.
+When to shut down and when to wake used to be two numbers in `CellConfig`, read
+by every cell in the pond, so the population could not disagree with itself: it
+shut down at the same instant and waited for the same unreachable bar. They are
+now a receptor, a neuron and an effector in each cell's own genome, quiescence
+is a depth on 0..1 rather than one of two states, and the hysteresis that dial
+provided comes from a neuron's heritable rate of forgetting. Sleeping deeply
+but briefly and lightly but long are things a lineage *is*. Sleep is also no
+longer free — a shut-down cell stops synthesising and loses the transporters it
+was living on — so permanent dormancy is a strategy the pond can select
+against. It is the third time a population here died as one and the third time
+the cause was a number that should have been per-cell.
+
+The measurement: at t = 1539 s of an `evolve.toml` run, 78 of 156 cells were
+shut down at a mean depth of 0.45 — half the pond asleep and half awake in the
+same water, where every earlier reading of that column was 0% or 100%. Peak
+population 157 against 141, seventy-five clone lines against forty-nine, and
+signal genes per cell *rising* from 4.1 to 5.1 as the population was culled, so
+the nervous system is being kept rather than shed. Births after the peak are
+still zero at `division_reserve = 1e-8`, because that was never dormancy: the
+population's measured spread will fund 3.11e-9 J and a daughter costs 1e-8.
+At 4e-10 — the setting where the pond used to go 100% dormant and never wake —
+238 of 2095 cells are awake and working through a shortage that shut the rest
+down, and the run records **three births after the peak against a previous
+zero**. Both runs still end extinct, because the pond still has no renewable
+living. That is the outstanding problem above and it was the outstanding
+problem before.
 
 `configs/evolve.toml` is the gate pond with the genome switched on; a test
 enforces that the two differ in nothing but the cell. `cells.genome` is off by

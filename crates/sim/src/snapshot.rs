@@ -27,7 +27,7 @@ use crate::config::WorldConfig;
 use crate::world::World;
 
 const MAGIC: &[u8; 8] = b"HADEANv1";
-const FORMAT: u32 = 5;
+const FORMAT: u32 = 6;
 /// zstd level 3 is the usual sweet spot: most of the ratio, little of the cost.
 const COMPRESSION: i32 = 3;
 
@@ -80,13 +80,15 @@ pub fn save(world: &World) -> anyhow::Result<Vec<u8>> {
         // chemistry are pure functions of those bytes and that chemistry --
         // the same argument that keeps the compound pool out of a snapshot --
         // so writing them too would be a second copy that could disagree with
-        // the first. The proteome is not: it is the cell's own state and two
-        // sisters carrying identical bytes do not carry identical protein.
+        // the first. The proteome and the activations are not: they are the
+        // cell's own state, and two sisters carrying identical bytes carry
+        // neither identical protein nor identical opinions.
         match &cell.genome {
             None => put_u64(&mut raw, u64::MAX),
             Some(g) => put_bytes(&mut raw, &g.bytes),
         }
         put_f32s(&mut raw, &cell.proteome);
+        put_f32s(&mut raw, &cell.activation);
     }
 
     let a = &world.audit;
@@ -207,11 +209,19 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
             }
         };
         let proteome = cursor.f32s()?;
+        let activation = cursor.f32s()?;
         if let Some(g) = &genome {
             if proteome.len() != g.genes.len() {
                 anyhow::bail!(
                     "cell {id} carries {} proteins for {} genes",
                     proteome.len(),
+                    g.genes.len()
+                );
+            }
+            if activation.len() != g.genes.len() {
+                anyhow::bail!(
+                    "cell {id} carries {} activations for {} genes",
+                    activation.len(),
                     g.genes.len()
                 );
             }
@@ -230,6 +240,9 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
             traits,
             genome,
             proteome,
+            activation,
+            // A readout, recomputed on the cell's next tick. See `Cell`.
+            quiesce: 0.0,
         });
     }
 
@@ -476,6 +489,11 @@ mod tests {
                 g
             })),
             proteome: vec![0.5; genes],
+            // Non-zero, and different from the proteome: a snapshot that
+            // dropped the network's state would reload a cell that had
+            // forgotten what it was in the middle of deciding.
+            activation: (0..genes).map(|i| 0.1 * i as f32 - 0.3).collect(),
+            quiesce: 0.0,
         });
         let digest = w.state_digest();
 

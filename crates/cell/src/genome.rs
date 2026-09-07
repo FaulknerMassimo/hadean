@@ -43,16 +43,37 @@
 //!    let the copies drift, and each specialises -- which is how real protein
 //!    families arise.
 //!
+//! # Two things a site can be
+//!
+//! Every gene carries up to three [`Site`]s: a motif, and a signed weight.
+//! What a site *is* depends on the class of the gene that carries it, and
+//! there is one rule:
+//!
+//! * on a gene whose protein does chemistry -- enzyme, transporter,
+//!   structural, regulator -- a site is a **promoter binding site**. What
+//!   binds there is a transcription factor, and the weight is how much that
+//!   binding drives the gene. This is [`Targets::sites`], and it is the
+//!   regulatory network.
+//! * on a `Neural` or `Effector` gene, a site is a **dendrite**. What arrives
+//!   there is the signal emitted by receptors and neurons, and the weight is
+//!   synaptic. This is [`Targets::dendrites`], and it is the nervous system.
+//!
+//! One structure, two networks, and a mutation that flips a gene's class byte
+//! moves its inputs from one to the other. The cost of the rule is that a
+//! neuron's *expression* cannot itself be transcriptionally regulated -- it
+//! runs at its basal level -- and that is the price of not extending the byte
+//! format, which would have made every genome written before this
+//! undecodable. A neuron's gain is still genomic: `basal` is six bits of the
+//! control byte and `params[0]` is its strength.
+//!
 //! # What is not here
 //!
-//! `Adhesion`, `Receptor`, `Effector` and `Neural` decode and cost upkeep but
-//! do nothing: there is no cell-cell physics, no sensor plumbing and no
-//! neural layer for them to act through yet. They are not stubs to be filled
-//! in with something else later -- their class codes are part of the genome
-//! format, and reserving them now means an L5 or L6 genome stays readable by
-//! this decoder. Until then they are exactly what a nonfunctional protein is
-//! in a real cell: a synthesis bill with nothing on the other side, and
-//! therefore selected against.
+//! `Adhesion` decodes and costs upkeep but does nothing: there is no cell-cell
+//! physics for it to act through yet. It is not a stub to be filled in with
+//! something else later -- its class code is part of the genome format, and
+//! reserving it means an L5 genome stays readable by this decoder. Until then
+//! it is exactly what a nonfunctional protein is in a real cell: a synthesis
+//! bill with nothing on the other side, and therefore selected against.
 
 use hadean_chem::chemistry::{Chemistry, CompoundId, Drive, ReactionId, KEY_DIM};
 use hadean_core::hash::{HashState, StateHasher};
@@ -102,14 +123,21 @@ pub enum ProteinClass {
     Structural = 2,
     /// L5. Binds cells with matching keys.
     Adhesion = 3,
-    /// L6. Senses a channel or compound.
+    /// Senses one channel of the world or of the cell itself and emits what it
+    /// finds as a signal at its own key. `params[1]` picks the channel; for
+    /// the chemical channels the key also picks the compound, exactly as a
+    /// transporter's does. See [`crate::neural::Channel`].
     Receptor = 4,
-    /// L6. Thrust, luminescence, secretion, lysis -- where predation comes
-    /// from, when there is something for it to act on.
+    /// Acts. `params[1]` picks which of the things a cell can physically do it
+    /// drives -- shutting down, dividing, opening a transporter, swimming --
+    /// and its dendrites decide how hard. See [`crate::neural::Action`].
     Effector = 5,
     /// Transcription factor: binds promoters, so genes can regulate genes.
     Regulator = 6,
-    /// L6. Declares a neuron.
+    /// A neuron. Sums its dendrites, squashes, and emits the result at its own
+    /// key, carrying a fraction of last tick's activation forward -- so a
+    /// network of them has memory, and hysteresis is something a lineage
+    /// evolves rather than something a config file sets.
     Neural = 7,
 }
 
@@ -130,10 +158,28 @@ impl ProteinClass {
     /// Whether this class has anything to act on in the world as it stands.
     /// An inert protein still costs its synthesis and upkeep.
     pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Enzyme | Self::Transporter | Self::Structural | Self::Regulator
-        )
+        self != Self::Adhesion
+    }
+
+    /// Whether this class puts a value onto the signal network. Receptors emit
+    /// what they sense and neurons emit what they compute; nothing else is
+    /// heard by a dendrite.
+    pub fn emits_signal(self) -> bool {
+        matches!(self, Self::Receptor | Self::Neural)
+    }
+
+    /// Whether this protein is part of the cell's nervous system rather than
+    /// its metabolism -- something it decides *with* rather than something it
+    /// lives *on*.
+    pub fn is_signal(self) -> bool {
+        matches!(self, Self::Receptor | Self::Neural | Self::Effector)
+    }
+
+    /// Whether this gene's [`Site`]s are dendrites rather than promoter
+    /// binding sites. See the module docs: it is the same structure read two
+    /// ways, and the class byte is what decides which.
+    pub fn listens(self) -> bool {
+        matches!(self, Self::Neural | Self::Effector)
     }
 }
 
@@ -174,6 +220,49 @@ impl Gene {
         let p = self.params[0];
         4.0 * p * p
     }
+
+    /// `params[1]`, quantised onto `0..n`. What a receptor senses and what an
+    /// effector does are both a choice out of a fixed list of things a cell
+    /// physically has -- eyes, a membrane, a flagellum -- and this is how the
+    /// genome makes it. The *list* is physiology and lives in
+    /// [`crate::neural`]; which entry a gene picks is genetic.
+    ///
+    /// A byte spans `n` selections, so a substitution steps between adjacent
+    /// choices only near a boundary. That is deliberate: a receptor should not
+    /// change what it looks at every time a base flips.
+    pub fn selector(&self, n: usize) -> usize {
+        debug_assert!(n > 0);
+        ((self.params[1] * n as f32) as usize).min(n - 1)
+    }
+
+    /// `params[2]` as a signed bias on `-4..4`: what a neuron or an effector
+    /// does with no input at all. The same range as a [`Site`] weight, so a
+    /// single dendrite can exactly cancel a bias.
+    pub fn bias(&self) -> f32 {
+        (self.params[2] - 0.5) * 8.0
+    }
+
+    /// `params[3]` as a neuron's rate of forgetting, per second, logarithmic
+    /// over `0.1..20`.
+    ///
+    /// This is where sleeping deeply-but-briefly and lightly-but-long come
+    /// from, and the reason a genome cell does not read
+    /// [`CellConfig::dormancy_exit`](crate::CellConfig::dormancy_exit) --
+    /// which is one hysteresis for the whole pond, and a pond with one
+    /// hysteresis cannot have some cells riding out a shortage that others
+    /// give up on. A neuron relaxes towards what its dendrites say at
+    /// this rate, so a slow one holds its state across a shortage the way a
+    /// fast one cannot. Logarithmic because the useful range spans a time
+    /// constant of ten seconds to fifty milliseconds, and a linear map would
+    /// spend nine tenths of the byte range on the fast end.
+    pub fn leak(&self) -> f32 {
+        0.1 * 200.0f32.powf(self.params[3])
+    }
+
+    /// `params[3]` as an axis, for the effectors that need one.
+    pub fn axis(&self) -> usize {
+        ((self.params[3] * 3.0) as usize).min(2)
+    }
 }
 
 /// What one gene's protein can act on in this particular chemistry.
@@ -200,7 +289,20 @@ pub struct Targets {
     /// ancestor's six genes and is not the point -- a genome that duplicates
     /// its way to thirty would be paying it a thousand times a second per
     /// cell.
+    ///
+    /// Empty on a gene whose sites are dendrites -- see the module docs.
     pub sites: Vec<Vec<(usize, f32)>>,
+    /// The other reading of the same sites: for each dendrite of a `Neural` or
+    /// `Effector` gene, which receptors and neurons it hears and how loudly,
+    /// by gene index, ascending.
+    ///
+    /// Resolved here for the same reason `sites` is -- who is wired to whom is
+    /// a fact about the byte string, not about the cell, and a cell steps a
+    /// hundred times a second. What changes per tick is the *activation*
+    /// travelling down these wires, and that is per-cell state.
+    ///
+    /// Empty on a gene whose sites are promoter binding sites.
+    pub dendrites: Vec<Vec<(usize, f32)>>,
 }
 
 /// Affinities below this are not worth carrying in a target list. A protein
@@ -257,9 +359,16 @@ impl Genome {
     /// Work out what each protein acts on, and how strongly.
     ///
     /// Enzymes match reactions and transporters match compounds, both through
-    /// the same [`affinity`]. Targets are sorted by id, not by affinity: the
-    /// cell layer applies reactions in id order, and that order is part of the
-    /// replay contract.
+    /// the same [`affinity`]. Receptors and effectors match compounds too --
+    /// a chemoreceptor tastes what a transporter would carry, and by the same
+    /// rule, so a lineage that evolves a transporter for something has already
+    /// evolved most of a sensor for it. Targets are sorted by id, not by
+    /// affinity: the cell layer applies reactions in id order, and that order
+    /// is part of the replay contract.
+    ///
+    /// Then two passes that cannot happen in the same loop, because both are
+    /// gene-to-gene and need every gene decoded first: promoter binding, and
+    /// the wiring of the signal network.
     pub fn bind(&mut self, chem: &Chemistry, enzyme_sigma: f32, transport_sigma: f32) {
         let scale = KeyScale::of(chem);
         self.targets = self
@@ -283,7 +392,7 @@ impl Genome {
                         }
                         t.reactions.sort_by_key(|&(id, _)| id);
                     }
-                    ProteinClass::Transporter => {
+                    ProteinClass::Transporter | ProteinClass::Receptor | ProteinClass::Effector => {
                         for c in &chem.compounds {
                             let a = affinity(&gene.key, &scale.normalise(&c.key), transport_sigma);
                             if a >= AFFINITY_FLOOR {
@@ -298,26 +407,49 @@ impl Genome {
             })
             .collect();
 
-        // Promoter binding, which is gene-to-gene and so cannot be resolved in
-        // the same pass: it needs every gene decoded before any gene's sites
-        // can be matched against them.
+        // Promoter binding and neural wiring. Both are gene-to-gene, so
+        // neither can be resolved in the pass above: each needs every gene
+        // decoded before any gene's sites can be matched against them.
+        //
+        // A gene's sites go to exactly one of the two, decided by its class.
+        // A wire whose affinity is below the floor is not carried at all --
+        // the same rule as an enzyme too far from a reaction to be catalysing
+        // it, and the thing that keeps a thirty-gene genome from paying for a
+        // dense matrix a hundred times a second.
         let regulators: Vec<(usize, &Gene)> = self
             .genes
             .iter()
             .enumerate()
             .filter(|(_, g)| g.class == ProteinClass::Regulator)
             .collect();
+        let sources: Vec<(usize, &Gene)> = self
+            .genes
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.class.emits_signal())
+            .collect();
         for (gene, targets) in self.genes.iter().zip(&mut self.targets) {
-            targets.sites = gene
-                .sites
-                .iter()
-                .map(|site| {
-                    regulators
-                        .iter()
-                        .map(|&(j, r)| (j, affinity(&r.key, &site.motif, REGULATOR_SIGMA)))
-                        .collect()
-                })
-                .collect();
+            let wire = |from: &[(usize, &Gene)], motif: &[f32; KEY_DIM], sigma: f32| {
+                from.iter()
+                    .filter_map(|&(j, g)| {
+                        let a = affinity(&g.key, motif, sigma);
+                        (a >= AFFINITY_FLOOR).then_some((j, a))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if gene.class.listens() {
+                targets.dendrites = gene
+                    .sites
+                    .iter()
+                    .map(|site| wire(&sources, &site.motif, SIGNAL_SIGMA))
+                    .collect();
+            } else {
+                targets.sites = gene
+                    .sites
+                    .iter()
+                    .map(|site| wire(&regulators, &site.motif, REGULATOR_SIGMA))
+                    .collect();
+            }
         }
     }
 
@@ -537,6 +669,16 @@ impl KeyScale {
 /// differentiate.
 pub const REGULATOR_SIGMA: f32 = 0.15;
 
+/// Width of a dendrite's recognition of a signal.
+///
+/// A not-a-config-dial for the same reason [`REGULATOR_SIGMA`] is: it decides
+/// how sharply one neuron picks out another from the crowd, and nothing about
+/// the world turns on the answer. It is the same width, and deliberately so --
+/// a promoter site and a dendrite are the same eight bytes read twice, and
+/// giving them different widths would mean a gene's inputs silently rewired
+/// themselves when a mutation changed its class.
+pub const SIGNAL_SIGMA: f32 = REGULATOR_SIGMA;
+
 /// The one matching function in the simulation.
 ///
 /// `exp(-||a - b||^2 / sigma^2)`. `sigma` is the width of a protein's
@@ -556,8 +698,13 @@ pub fn affinity(a: &[f32; KEY_DIM], b: &[f32; KEY_DIM], sigma: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// Assemble the bytes of one gene.
+///
+/// Public because [`ancestor`] is one caller and not the only legitimate one:
+/// this is how a genome is *written* rather than evolved, and the tests that
+/// check an interpreter need to be able to hand it a protein of a known shape
+/// rather than mutating until one appears.
 #[allow(clippy::too_many_arguments)]
-fn write_gene(
+pub fn write_gene(
     out: &mut Vec<u8>,
     promoter: &[f32; KEY_DIM],
     basal: f32,
@@ -607,7 +754,7 @@ fn write_junk(out: &mut Vec<u8>, rng: &Counter, entity: u64, stream: u64, n: usi
 /// living that the hardcoded protocell made, and mutation starts from a cell
 /// that works rather than from noise.
 ///
-/// Five genes:
+/// The metabolism:
 ///
 /// * one **enzyme** on `reaction`, the ancestral metabolism;
 /// * one **transporter** per substrate of that reaction, so it can get the
@@ -619,6 +766,35 @@ fn write_junk(out: &mut Vec<u8>, rng: &Counter, entity: u64, stream: u64, n: usi
 ///   promoter. It does nothing useful on day one and is deliberately included:
 ///   a regulatory network cannot evolve out of nothing, and this is the seed
 ///   crystal for one.
+///
+/// And the nervous system -- one arc, three synapses long:
+///
+/// * a **receptor** on [`Channel::Energy`](crate::neural::Channel::Energy),
+///   emitting at `hunger`. How much reserve there is, as a fraction of what
+///   would see the cell through a famine.
+/// * a **neuron** listening at `hunger` with a weight of -4 and a bias of
+///   +0.6, emitting at `sleep`. It says *shut down*, and it says it when the
+///   reserve falls below about fifty seconds of upkeep. Its rate of forgetting
+///   is a third of a second's worth per second, so it holds an opinion for a
+///   few seconds rather than re-forming one every tick -- which is the job
+///   `dormancy_exit` used to do, done by something heritable.
+/// * an **effector** on `Action::Quiesce` listening at `sleep`, weight +4.
+/// * an **effector** on `Action::Divide` listening at `sleep`, weight -4, bias
+///   +1: divide freely, unless the same signal that shuts the cell down says
+///   otherwise.
+///
+/// This circuit is *approximately* the rule it replaces -- shut down around
+/// fifty seconds of banked upkeep, which is where `dormancy_exit = 60` put the
+/// old wake bar -- and that is on purpose. The claim being tested is not that
+/// a hand-written network is cleverer than a hand-written threshold. It is
+/// that a network is made of parts that mutate: a weight, a bias, a rate of
+/// forgetting, a channel, and which effector hears what. Sixteen founders of
+/// it are sixteen different opinions about when to sleep and how deeply, and
+/// the pond keeps whichever were right.
+///
+/// `hunger` and `sleep` are two arbitrary fixed addresses in key space, chosen
+/// about two units apart so that at [`SIGNAL_SIGMA`] neither wire hears the
+/// other's traffic. Nothing stops a mutation from moving one until they do.
 pub fn ancestor(chem: &Chemistry, reaction: ReactionId, rng: &Counter, entity: u64) -> Genome {
     let r = chem.reaction(reaction);
     let scale = KeyScale::of(chem);
@@ -630,6 +806,11 @@ pub fn ancestor(chem: &Chemistry, reaction: ReactionId, rng: &Counter, entity: u
     // seed.
     let regulated: [f32; KEY_DIM] = [0.7, 0.2, 0.6, 0.1, 0.4, 0.9, 0.3, 0.55];
     let plain: [f32; KEY_DIM] = [0.5; KEY_DIM];
+    // The two signal addresses. Far apart in key space -- eight components at
+    // 0.7 of separation each -- so `affinity` between them is exp(-174) and a
+    // dendrite on one hears nothing of the other.
+    let hunger: [f32; KEY_DIM] = [0.15, 0.85, 0.25, 0.75, 0.35, 0.65, 0.45, 0.55];
+    let sleep: [f32; KEY_DIM] = [0.85, 0.15, 0.75, 0.25, 0.65, 0.35, 0.55, 0.45];
 
     write_junk(&mut out, rng, entity, stream, 24);
     stream += 24;
@@ -702,6 +883,91 @@ pub fn ancestor(chem: &Chemistry, reaction: ReactionId, rng: &Counter, entity: u
         ProteinClass::Regulator,
         &regulated,
         &[0.0; N_PARAMS],
+        0.05,
+    );
+
+    write_junk(&mut out, rng, entity, stream, 16);
+    stream += 16;
+
+    // ---- the nervous system ------------------------------------------------
+    //
+    // Params are positioned, not named, and the positions are the same for
+    // every class: [0] is strength, [1] is which channel or which action, [2]
+    // is bias, [3] is a rate or an axis. See `Gene::selector`, `Gene::bias`
+    // and `Gene::leak` for the maps; the constants below are their inverses.
+
+    // Hunger. `Channel::Energy` is 2 of 8, so params[1] sits in the middle of
+    // the third eighth. Strength 1.5 against a basal of 0.7 opens it fully.
+    let mut receptor_params = [0.0f32; N_PARAMS];
+    receptor_params[0] = 0.61;
+    receptor_params[1] = 0.3125;
+    write_gene(
+        &mut out,
+        &plain,
+        0.7,
+        &[],
+        ProteinClass::Receptor,
+        &hunger,
+        &receptor_params,
+        0.05,
+    );
+
+    write_junk(&mut out, rng, entity, stream, 12);
+    stream += 12;
+
+    // The decision. bias +0.6, so tanh(0.6 - 4 * hunger) crosses zero at a
+    // reserve of about fifty seconds of upkeep; leak 0.3/s, so it takes a
+    // few seconds to change its mind.
+    let mut neuron_params = [0.0f32; N_PARAMS];
+    neuron_params[0] = 0.61;
+    neuron_params[2] = 0.575;
+    neuron_params[3] = 0.21;
+    write_gene(
+        &mut out,
+        &plain,
+        0.7,
+        &[(hunger, -4.0)],
+        ProteinClass::Neural,
+        &sleep,
+        &neuron_params,
+        0.05,
+    );
+
+    write_junk(&mut out, rng, entity, stream, 12);
+    stream += 12;
+
+    // Shut down when the neuron says so.
+    let mut quiesce_params = [0.0f32; N_PARAMS];
+    quiesce_params[0] = 0.56;
+    quiesce_params[1] = 0.125;
+    quiesce_params[2] = 0.5;
+    write_gene(
+        &mut out,
+        &plain,
+        0.8,
+        &[(sleep, 4.0)],
+        ProteinClass::Effector,
+        &plain,
+        &quiesce_params,
+        0.05,
+    );
+
+    write_junk(&mut out, rng, entity, stream, 12);
+    stream += 12;
+
+    // And do not spend a reserve on a daughter while doing it.
+    let mut divide_params = [0.0f32; N_PARAMS];
+    divide_params[0] = 0.56;
+    divide_params[1] = 0.375;
+    divide_params[2] = 0.625;
+    write_gene(
+        &mut out,
+        &plain,
+        0.8,
+        &[(sleep, -4.0)],
+        ProteinClass::Effector,
+        &plain,
+        &divide_params,
         0.05,
     );
 

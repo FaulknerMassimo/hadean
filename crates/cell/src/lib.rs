@@ -21,6 +21,24 @@
 //! `maintain` knows which it was handed. That is deliberate: it keeps the
 //! pre-genome path arithmetically identical to what it was, so the control is
 //! a real control and not a reimplementation of one.
+//!
+//! # Where the decisions live
+//!
+//! There are four moments in a cell's tick where something is *chosen* rather
+//! than suffered: whether to shut down, whether to divide, what to let across
+//! the membrane, and where to swim. For a pre-genome cell all four are in this
+//! file, as thresholds on config numbers, and every cell in the pond makes the
+//! same choice at the same moment because they are reading the same two dials.
+//!
+//! For a genome cell none of them are here. They arrive in [`Expression`] from
+//! [`neural`], which reads a network the genome specifies -- receptors, then
+//! neurons, then effectors -- and this file does what it is told. The
+//! difference that matters is not that the network is cleverer. It is that
+//! `dormancy_exit` was one number for the whole population and a neuron's
+//! `leak` is four bits in each cell's own genome, so a shortage that used to
+//! shut every cell down at the same instant now finds a population that
+//! disagrees about what to do -- which is the only raw material selection has
+//! ever had.
 
 use std::f32::consts::PI;
 use std::sync::Arc;
@@ -31,13 +49,16 @@ use hadean_core::rng::Purpose;
 use hadean_core::units::{Joules, KB, VISCOSITY};
 use hadean_core::{Axis, Counter, Grid, Schedule};
 use hadean_fields::heat::HeatField;
+use hadean_fields::light::LightField;
 use hadean_fields::scalar::ChemField;
 use hadean_fields::transport::FaceVelocity;
 use serde::{Deserialize, Serialize};
 
 pub mod genome;
+pub mod neural;
 
 pub use genome::{Genome, MutationRates, ProteinClass};
+pub use neural::{Action, Channel, Drives};
 
 /// Tunables for the hand-authored ancestor used before genomes exist.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -166,10 +187,17 @@ pub struct CellConfig {
     pub dormancy_power_fraction: f64,
     /// Seconds of working maintenance a dormant cell must bank before it wakes.
     ///
-    /// Shutting down happens the moment a cell cannot pay its full upkeep;
-    /// waking is deliberately a much higher bar, so a cell sitting on the
-    /// margin does not flicker between the two states every tick and average
-    /// back into having no dormancy at all.
+    /// **Pre-genome only.** Shutting down happens the moment a cell cannot pay
+    /// its full upkeep; waking is deliberately a much higher bar, so a cell
+    /// sitting on the margin does not flicker between the two states every
+    /// tick and average back into having no dormancy at all.
+    ///
+    /// A genome cell does not read this and there is no equivalent of it. The
+    /// flicker it exists to prevent is prevented instead by a neuron's own
+    /// rate of forgetting -- see [`genome::Gene::leak`] -- which is heritable,
+    /// so the hysteresis a lineage runs is something it evolves rather than
+    /// something every cell in the pond shares. That is the whole difference
+    /// between a population that shuts down together and one that does not.
     pub dormancy_exit: f32,
     /// Fraction of a corpse returned to the field per second.
     pub decomposition_rate: f32,
@@ -233,6 +261,45 @@ pub struct CellConfig {
     /// how much to carry is a trade a lineage makes against how hungry its
     /// pond is, not a number in this file.
     pub structural_benefit: f32,
+
+    // ---- L6 ----------------------------------------------------------------
+    /// Speed a cell swims at full thrust, m/s.
+    ///
+    /// Worth setting against `flow.speed`, which is what the water is doing
+    /// anyway: a cell that cannot out-swim the convection roll is a passenger,
+    /// and one that can leave it far behind makes the roll irrelevant. The
+    /// default is the same order as the pond's flow, which is also the order a
+    /// real bacterium manages -- twenty microns a second is most of a voxel.
+    pub swim_speed: f32,
+    /// Power drawn at full thrust, W.
+    ///
+    /// The price of the above, and it has to be a real one. Swimming free
+    /// would make a motility gene strictly better than not having one, and
+    /// then every lineage evolves a flagellum and the trait says nothing. Read
+    /// it against `maintenance_power`: the default is a fifth of a cell's
+    /// upkeep, so a cell that swims flat out is paying a fifth again to do it.
+    /// The cost is quadratic in speed, so half thrust is a twentieth.
+    pub motility_power: f64,
+    /// Rounds of mutation applied to each founder's genome before the run.
+    ///
+    /// The founding cohort are siblings from one hand-written ancestor, and at
+    /// the default per-byte rates a division mutates about one genome in two.
+    /// Sixteen founders therefore arrive as eight or nine distinct genomes
+    /// differing by a byte -- which is a cohort of clones with a rounding
+    /// error, not a population, and it is the state the first genome runs
+    /// actually started from.
+    ///
+    /// This is how far back the ancestor is placed. Each founder is put
+    /// through this many rounds of the *same* mutation operators every
+    /// division uses -- nothing founder-specific, so the variation the cohort
+    /// arrives with is drawn from exactly the distribution its descendants
+    /// will explore. Twenty rounds at the default rates is about a dozen
+    /// substitutions and a fair chance of a duplication, which is a genuinely
+    /// varied population of relatives.
+    ///
+    /// Zero reproduces the old behaviour: one ancestor, and whatever a single
+    /// division's worth of mutation happened to do to each copy.
+    pub founder_divergence: u32,
 }
 
 /// Total standing protein a cell carrying the hand-written ancestor's genome
@@ -242,7 +309,14 @@ pub struct CellConfig {
 /// `maintenance_power` and means the same thing it meant before genomes
 /// existed. A lineage that doubles its proteome doubles the machinery half of
 /// its bill, which is what stops a genome from being a free capability store.
-pub const PROTEOME_REFERENCE: f32 = 4.0;
+///
+/// Measured off the ancestor rather than chosen, and re-measured when the
+/// ancestor grew a nervous system -- a receptor, a neuron and two effectors
+/// are four more proteins to keep, and leaving this at its old value would
+/// have quietly charged every genome cell a third again for the privilege of
+/// being able to decide anything. `the_ancestor_costs_about_what_it_used_to`
+/// is the test that holds it to that.
+pub const PROTEOME_REFERENCE: f32 = 7.0;
 
 impl Default for CellConfig {
     fn default() -> Self {
@@ -270,6 +344,9 @@ impl Default for CellConfig {
             enzyme_sigma: 0.08,
             transport_sigma: 0.15,
             structural_benefit: 2.0,
+            swim_speed: 2.0e-5,
+            motility_power: 2.0e-12,
+            founder_divergence: 20,
         }
     }
 }
@@ -321,6 +398,12 @@ impl CellConfig {
         if self.structural_benefit < 1.0 || !self.structural_benefit.is_finite() {
             return Err("structural benefit is a multiplier and cannot be below one".into());
         }
+        if self.swim_speed < 0.0 || !self.swim_speed.is_finite() {
+            return Err("swim speed must be a finite non-negative speed".into());
+        }
+        if self.motility_power < 0.0 || !self.motility_power.is_finite() {
+            return Err("motility power must be a finite non-negative power".into());
+        }
         Ok(())
     }
 
@@ -368,6 +451,14 @@ pub enum CellState {
     /// are chemistry, not decisions the cell gets to make -- so a dormant cell
     /// still takes up whatever the water offers, and banks it instead of
     /// burning it. What it stops doing is paying full upkeep and growing.
+    ///
+    /// For a pre-genome cell this is a state, entered and left by the rules in
+    /// `maintain`. For a genome cell it is a **label**: dormancy is a depth
+    /// on 0..1 that the cell's own network chose, every bill is computed from
+    /// that depth directly, and this is set from it at `DORMANCY_REPORTED` so
+    /// that `dormant()`, the population chart and the snapshot go on meaning
+    /// what they meant. Read `mean_quiescence` beside it -- a pond at a mean
+    /// depth of 0.95 and one at 0.55 report the same count here.
     Dormant,
 }
 
@@ -496,10 +587,37 @@ pub struct Cell {
     ///
     /// This is where the same genome becomes two different cells, and it is
     /// the reason the proteome is per-cell state while the genome is shared.
-    /// Nothing reads it yet that varies between siblings; what it is for is
-    /// L5, where position and signal drive expression and one genome has to
-    /// produce a body with different tissues in it.
+    /// What it is for beyond that is L5, where position and signal drive
+    /// expression and one genome has to produce a body with different tissues
+    /// in it.
     pub proteome: Vec<f32>,
+    /// What each gene's protein is currently *saying*, -1..1, indexed by gene.
+    ///
+    /// Meaningful on receptors and neurons; zero elsewhere. This is the cell's
+    /// nervous system as state -- the wiring is in the shared genome and only
+    /// the traffic is here -- and it is why two sisters carrying identical
+    /// bytes in different corners of the pond do different things.
+    ///
+    /// It carries across a division along with the cytoplasm. A daughter
+    /// inherits her mother's frame of mind, which is both cheaper than
+    /// re-deriving it and the right answer: a cell that divided during a
+    /// famine should not wake up believing it is well fed.
+    pub activation: Vec<f32>,
+    /// How far shut down this cell was at the end of its last tick, 0..1.
+    ///
+    /// A **readout**, not state. It is recomputed from the proteome and the
+    /// activations at the top of every tick and nothing reads it back, so it
+    /// is deliberately absent from the digest and from the snapshot: writing
+    /// it into either would be a second copy of something already there that
+    /// could disagree with the first, which is the rule the decoded genome and
+    /// its bindings follow for the same reason. A reloaded cell reports zero
+    /// here until it has been stepped once.
+    ///
+    /// It exists because `dormant()` counts a threshold and the whole point of
+    /// the change is that there is no threshold. A pond at a mean depth of
+    /// 0.95 and a pond at 0.55 both report every cell dormant and are not the
+    /// same pond.
+    pub quiesce: f32,
 }
 
 impl Cell {
@@ -585,6 +703,19 @@ impl Cell {
         self.genome.as_ref().map_or(0, |g| g.genes.len())
     }
 
+    /// Genes making up the cell's nervous system: receptors, neurons and
+    /// effectors.
+    ///
+    /// The column to watch beside the population. It is upkeep with no
+    /// metabolic return, so a pond where it shrinks monotonically is one where
+    /// deciding anything does not pay -- which is a real finding about the
+    /// world, and one that would otherwise hide inside the gene count.
+    pub fn signal_genes(&self) -> usize {
+        self.genome.as_ref().map_or(0, |g| {
+            g.genes.iter().filter(|gene| gene.class.is_signal()).count()
+        })
+    }
+
     pub fn genome_len(&self) -> usize {
         self.genome.as_ref().map_or(0, |g| g.len())
     }
@@ -625,6 +756,10 @@ impl HashState for Cell {
             h.usize(self.proteome.len());
             for &c in &self.proteome {
                 h.f32(c);
+            }
+            h.usize(self.activation.len());
+            for &a in &self.activation {
+                h.f32(a);
             }
         }
     }
@@ -711,17 +846,19 @@ impl Population {
                 state: CellState::Alive,
                 generation: 0,
                 traits: Traits::founder(cfg, rng, id),
-                // Tick zero, entity `id`: a founder's mutations are a pure
-                // function of which founder it is, like its lifespan and its
-                // position, so the cohort is settled before the world starts
-                // rather than by the order they were pushed. Founders whose
-                // draw came up empty share the ancestor's allocation with each
-                // other, which is what makes them one clone line rather than
-                // sixteen identical ones.
+                // A founder's mutations are a pure function of which founder
+                // it is, like its lifespan and its position, so the cohort is
+                // settled before the world starts rather than by the order
+                // they were pushed. How far each one has drifted from the
+                // hand-written ancestor is `founder_divergence`; see
+                // `diverge_founder` for why one division's worth was not
+                // enough.
                 genome: founder
                     .as_ref()
-                    .map(|a| inherit_genome(a, cfg, chem, rng, 0, id)),
+                    .map(|a| diverge_founder(a, cfg, chem, rng, id)),
                 proteome: Vec::new(),
+                activation: Vec::new(),
+                quiesce: 0.0,
             });
         }
         self.next_id = self.cells.len() as u64;
@@ -769,6 +906,8 @@ impl Population {
         let mut sum_sq = 0.0;
         let mut genes = 0.0;
         let mut bytes = 0.0;
+        let mut signal = 0.0;
+        let mut quiescence = 0.0;
         // Distinct genomes, counted by content.
         //
         // Pointer identity would be cheaper and is what an `Arc` already
@@ -785,6 +924,8 @@ impl Population {
             sum_sq += u * u;
             genes += cell.gene_count() as f64;
             bytes += cell.genome_len() as f64;
+            signal += cell.signal_genes() as f64;
+            quiescence += cell.quiesce as f64;
             if let Some(g) = &cell.genome {
                 let mut h = StateHasher::new();
                 g.hash_state(&mut h);
@@ -804,6 +945,8 @@ impl Population {
             mean_genes: genes / n,
             mean_genome_bytes: bytes / n,
             distinct_genomes: lineages.len(),
+            mean_signal_genes: signal / n,
+            mean_quiescence: quiescence / n,
         }
     }
 
@@ -887,7 +1030,8 @@ impl Population {
         rng: &Counter,
         tick: u64,
         dt: f64,
-        growth_interval: u64,
+        schedule: &Schedule,
+        sensorium: &Sensorium,
         amounts: &mut ChemField,
         residual: &mut ChemField,
         heat: &mut HeatField,
@@ -897,7 +1041,13 @@ impl Population {
         let table = CompoundTable::new(chem);
         let mut expression = Expression::new(chem);
         let mut levels = Vec::new();
+        let mut signals = Vec::new();
         let mut daughters = Vec::new();
+        // Who is where, for the crowding sense. One pass over the population
+        // rather than a neighbour search per cell: crowding is a per-voxel
+        // fact, so it costs the same whether one cell asks or a thousand do.
+        let crowd = voxel_census(&self.cells, grid);
+        let neural_dt = Schedule::phase_dt(dt, schedule.neural);
         // Corpses are retained while their conserved contents cross back into
         // the fields, but they must not consume a slot in the *living*
         // population cap. Otherwise a synchronous die-off blocks every
@@ -914,35 +1064,69 @@ impl Population {
                 // `maintain`, which sets the bill and the state, and in
                 // division below.
                 CellState::Alive | CellState::Dormant => {
+                    // Sense, then decide, then act. The cell reads the voxel
+                    // it is standing in before it moves, which is both the
+                    // cheaper order and the right one: an animal acts on where
+                    // it has been, not on where it is about to be.
+                    let voxel = cell.voxel(grid);
+                    let temperature = heat.temperature(voxel);
+                    let world = neural::Surroundings {
+                        amounts,
+                        voxel,
+                        voxel_volume: grid.voxel_volume() as f64,
+                        brightness: sensorium.brightness(voxel),
+                        temperature,
+                        crowd: crowd[voxel],
+                        lifespan: lifespan(cfg, rng, cell.id),
+                    };
+                    neural::sense_and_think(
+                        cell,
+                        cfg,
+                        &world,
+                        &mut signals,
+                        Schedule::due_for(tick, cell.id, schedule.neural),
+                        neural_dt,
+                    );
+
+                    // What this cell's heritable state comes to today. For a
+                    // pre-genome cell this is its one trait and its one
+                    // reaction; for a genome cell it is whatever its proteome
+                    // currently expresses -- and, now, whatever its effectors
+                    // decided to do about it.
+                    expression.read(cell, cfg, metabolism, dt);
+                    // Transcription after expression, not before: a cell that
+                    // has just chosen to shut down synthesises at the rate it
+                    // chose, and it is this tick's decision that throttles it.
+                    let activity = neural::activity(cfg, expression.drives.quiesce) as f32;
+                    transcribe(cell, &mut levels, activity, dt);
+
                     move_cell(
                         cell,
+                        cfg,
                         grid,
                         flow,
                         rng,
                         tick,
                         dt,
-                        heat.temperature(cell.voxel(grid)),
+                        temperature,
+                        &expression.drives.thrust,
                     );
-                    // What this cell's heritable state comes to today. For a
-                    // pre-genome cell this is its one trait and its one
-                    // reaction; for a genome cell it is whatever its proteome
-                    // currently expresses, which changed since last tick and
-                    // will change again.
-                    transcribe(cell, &mut levels, dt);
-                    expression.read(cell, metabolism);
                     exchange(cell, cfg, grid, &table, &expression, amounts, residual, dt);
                     metabolize(cell, cfg, grid, chem, &expression, &table, heat, dt);
-                    maintain(cell, cfg, grid, heat, dt);
+                    maintain(cell, cfg, &expression, grid, heat, dt);
+                    cell.quiesce = expression.drives.quiesce;
                     cell.age += dt as f32;
                     cell.radius = growth_radius(cfg, cell.reserve);
 
-                    // Only a cell paying its way divides. Dormancy is what
-                    // a cell does instead of growing, and `dormancy_exit` sits
-                    // far below `division_reserve` anyway, so a cell with the
-                    // reserve to split has long since woken up.
-                    if cell.state == CellState::Alive
+                    // Only a cell paying its way divides, and only if its own
+                    // genome agrees that now is the time. For a pre-genome
+                    // cell `divide` is always true and `state` is the old
+                    // rule; for a genome cell the state is a label and the
+                    // decision is an effector's.
+                    if (expression.governed || cell.state == CellState::Alive)
+                        && expression.drives.divide
                         && division_slots > 0
-                        && Schedule::due_for(tick, cell.id, growth_interval)
+                        && Schedule::due_for(tick, cell.id, schedule.growth)
                         && cell.reserve >= cfg.division_reserve
                     {
                         let child = divide(cell, cfg, chem, grid, rng, tick, self.next_id);
@@ -1006,6 +1190,15 @@ pub struct TraitSummary {
     /// that individual traits were introduced to break, arriving by a longer
     /// road. It is the number to watch beside the population.
     pub distinct_genomes: usize,
+    /// Mean receptors, neurons and effectors per living cell.
+    pub mean_signal_genes: f64,
+    /// Mean quiescence depth across the living, 0..1.
+    ///
+    /// `dormant` counts cells past a reporting threshold and this is what the
+    /// threshold was applied to. The two say different things and the
+    /// difference is the point: a pond at a mean depth of 0.95 has committed,
+    /// and one at 0.55 is a population arguing with itself about whether to.
+    pub mean_quiescence: f64,
 }
 
 impl TraitSummary {
@@ -1107,12 +1300,18 @@ pub fn choose_metabolism(chem: &Chemistry, abundance: &[f64], voxels: usize) -> 
 pub struct Expression {
     /// Membrane permeability multiplier, per compound.
     ///
-    /// A genome cell's is `1 + transporters`: the one is the lipid bilayer,
-    /// which passes small nonpolar molecules whatever the cell would prefer,
-    /// and the rest is machinery it evolved. So a cell can specialise on its
-    /// food without ever being able to seal itself off, which is both the
-    /// physics and the thing that stops a lineage from mutating into a sealed
-    /// box that starves.
+    /// A genome cell's is `1 + gate * transporters`: the one is the lipid
+    /// bilayer, which passes small nonpolar molecules whatever the cell would
+    /// prefer, and the rest is machinery it evolved. So a cell can specialise
+    /// on its food without ever being able to seal itself off, which is both
+    /// the physics and the thing that stops a lineage from mutating into a
+    /// sealed box that starves.
+    ///
+    /// `gate` is what an `Action::Ingest` effector decided, on 0..2, and it is
+    /// one for every compound no effector is watching. Note where it sits in
+    /// that expression: a cell can shut its own transporters and it cannot
+    /// touch the bilayer, which is the same invariant read from the other
+    /// side.
     pub uptake: Vec<f32>,
     /// Catalysed rate per reaction, in multiples of `metabolic_rate`.
     pub catalysis: Vec<f32>,
@@ -1120,6 +1319,25 @@ pub struct Expression {
     /// the same convention the field chemistry uses and for the same reason:
     /// the result depends on the order, so the order has to be fixed.
     pub active: Vec<ReactionId>,
+    /// What the cell's own network decided to do this tick.
+    pub drives: Drives,
+    /// Whether [`drives`](Self::drives) came from a genome or from the
+    /// defaults.
+    ///
+    /// The lifecycle needs to tell the two apart because they are not the same
+    /// claim. `false` means "this cell has no nervous system, fall back to the
+    /// pre-genome rules", which keeps the Phase 2 control arithmetically
+    /// identical. `true` means "this is what the cell chose", including when
+    /// what it chose was nothing -- a genome cell with no quiescence effector
+    /// does not fall back to shutting down when it runs short. It simply does
+    /// not shut down, pays the full bill, and dies of it if the pond does not
+    /// improve. That is the honest reading of a genome with no such gene, and
+    /// making it fall back would put the hardcoded rule straight back in as a
+    /// safety net that every lineage could free-ride on.
+    pub governed: bool,
+    /// Per-compound multiplier an `Ingest` effector puts on the cell's
+    /// transporters. Scratch, valid only while `drives.gating`.
+    ingest: Vec<f32>,
 }
 
 impl Expression {
@@ -1128,14 +1346,19 @@ impl Expression {
             uptake: vec![0.0; chem.n_compounds()],
             catalysis: vec![0.0; chem.reactions.len()],
             active: Vec::new(),
+            drives: Drives::default(),
+            governed: false,
+            ingest: vec![0.0; chem.n_compounds()],
         }
     }
 
     /// Read one cell's heritable state into this scratch.
-    pub fn read(&mut self, cell: &Cell, metabolism: Option<ReactionId>) {
+    pub fn read(&mut self, cell: &Cell, cfg: &CellConfig, metabolism: Option<ReactionId>, dt: f64) {
         for r in self.active.drain(..) {
             self.catalysis[r as usize] = 0.0;
         }
+        self.drives = Drives::default();
+        self.governed = false;
 
         let Some(g) = &cell.genome else {
             // The pre-genome protocell: one multiplier for every compound and
@@ -1185,6 +1408,18 @@ impl Expression {
             }
         }
         self.active.sort_unstable();
+
+        // The effectors, last, because an `Ingest` gate acts on the
+        // transporters just accumulated above.
+        self.governed = true;
+        self.drives = neural::drive(cell, cfg, dt, &mut self.ingest);
+        if self.drives.gating {
+            for (c, u) in self.uptake.iter_mut().enumerate() {
+                // The bilayer is not negotiable: only what the cell built on
+                // top of it is scaled. See `neural::drive`.
+                *u = 1.0 + self.ingest[c] * (*u - 1.0);
+            }
+        }
     }
 }
 
@@ -1246,6 +1481,93 @@ fn inherit_genome(
         }
         None => Arc::clone(parent),
     }
+}
+
+/// The parts of the world a receptor can read that the cell layer does not
+/// already hold.
+///
+/// Light is the whole of it today. It is passed rather than reached for
+/// because `hadean_cell` steps against fields it is handed, and because the
+/// pre-genome control and most unit tests have no light field at all --
+/// [`dark`](Self::dark) is the honest answer for those, not a stub.
+pub struct Sensorium<'a> {
+    pub light: Option<&'a LightField>,
+    /// Noon irradiance summed over bands, W/m^2: the divisor that turns an
+    /// intensity into a fraction of full sun, so a `Channel::Light` receptor
+    /// reads the same 0..1 in a bright world and a dim one.
+    pub full_sun: f32,
+}
+
+impl Sensorium<'_> {
+    /// A world with no sun in it, or none this code was given.
+    pub fn dark() -> Self {
+        Self {
+            light: None,
+            full_sun: 1.0,
+        }
+    }
+
+    /// Light at a voxel as a fraction of full surface sun.
+    pub fn brightness(&self, voxel: usize) -> f32 {
+        match self.light {
+            Some(light) if self.full_sun > 0.0 => {
+                (light.brightness(voxel) / self.full_sun).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+/// Living cells per voxel.
+///
+/// One pass over the population instead of a neighbour search per cell:
+/// crowding is a fact about a voxel, so it costs the same whether one cell
+/// asks or a thousand do. Corpses are not counted -- a cell competes with what
+/// eats, and a corpse is a resource rather than a rival.
+fn voxel_census(cells: &[Cell], grid: &Grid) -> Vec<u32> {
+    let mut census = vec![0u32; grid.len()];
+    for cell in cells.iter().filter(|c| c.is_alive()) {
+        census[cell.voxel(grid)] += 1;
+    }
+    census
+}
+
+/// Push one founder back from the hand-written ancestor.
+///
+/// The founding cohort used to be the ancestor copied once per founder through
+/// [`inherit_genome`], which is one division's worth of mutation. At the
+/// default per-byte rates that leaves about half of them byte-identical to the
+/// ancestor and the rest differing by a single substitution -- and the first
+/// genome runs duly recorded four distinct lineages out of sixteen founders,
+/// with a standing variation five times *narrower* than the scalar trait the
+/// genome replaced. A population that starts as clones has nothing for
+/// selection to act on until mutation supplies some, and mutation is
+/// per-division, so a population that starts as clones and then stops dividing
+/// never gets any at all. That is most of why the pond froze.
+///
+/// So each founder is run through the operators `founder_divergence` times
+/// instead of once. Nothing founder-specific happens: it is the same
+/// [`genome::replicate`], at the same rates, and the variation the cohort
+/// arrives with is therefore drawn from exactly the distribution its
+/// descendants will go on exploring. It places the ancestor some generations
+/// in the past rather than at t = 0, which is also the more honest picture --
+/// life does not arrive at a pond having just been invented.
+///
+/// The round index stands in for the tick, so a founder's whole history is a
+/// pure function of its id and the world seed, settled before the clock
+/// starts.
+fn diverge_founder(
+    ancestor: &Arc<Genome>,
+    cfg: &CellConfig,
+    chem: &Chemistry,
+    rng: &Counter,
+    id: u64,
+) -> Arc<Genome> {
+    let mut genome = Arc::clone(ancestor);
+    for round in 0..=cfg.founder_divergence as u64 {
+        genome = inherit_genome(&genome, cfg, chem, rng, round, id);
+    }
+    genome
 }
 
 /// Indices into `cells`, ordered by the voxel each one occupies.
@@ -1409,7 +1731,45 @@ fn metabolize(
 /// is half updated -- otherwise a gene's own product feeds back into its own
 /// level within a single tick -- and because a population of a few hundred
 /// would otherwise allocate a vector per cell per tick.
-fn transcribe(cell: &mut Cell, scratch: &mut Vec<f32>, dt: f64) {
+///
+/// # What makes sleep expensive
+///
+/// `activity` is the fraction of its working bill the cell is currently
+/// paying, and a gene's level is scaled by it. That one multiplication is what
+/// stops quiescence from being free.
+///
+/// Without it, a cell that shuts down pays five per cent of its upkeep and
+/// goes on taking up food and catalysing at full rate -- strictly better than
+/// staying awake, so the only stable strategy is permanent sleep, which is
+/// very nearly what the hardcoded version produced. With it, a cell that shuts
+/// down stops synthesising protein, its proteome decays at each protein's own
+/// `stability`, and within a minute or two it has lost the transporters and
+/// enzymes it was living on. It is genuinely cheaper *and* genuinely poorer,
+/// it takes real time to spin back up, and how deeply to go and how long to
+/// stay are exactly the trade the network is choosing over. That is a spore,
+/// and it is the mechanism the pond has been missing.
+///
+/// # Why the nervous system is exempt
+///
+/// The throttle applies to what a cell lives *on*, not to what it decides
+/// *with*: receptors, neurons and effectors transcribe at their full level
+/// whatever the depth.
+///
+/// This is not a kindness, it is the difference between a cell that is asleep
+/// and a cell that has fainted. The first version scaled everything, and the
+/// arithmetic closes on itself: shutting down decays the receptor that reads
+/// the reserve and the effector that acts on it, which lowers the depth, which
+/// restores them. The ancestor settled at a quiescence of 0.47 and could not
+/// go deeper however hungry it got -- a cell physically unable to commit to
+/// sleeping, because the organ it sleeps with was the first thing it switched
+/// off. Nothing could ever have woken it up either, for the same reason.
+///
+/// A real spore keeps its stress-sensing machinery running and shuts down the
+/// metabolism, and this is the same statement. It is also charged for: the
+/// nervous system is still on the upkeep bill through [`Cell::machinery`], so
+/// a lineage that evolves a large brain pays for it in every famine it sits
+/// through.
+fn transcribe(cell: &mut Cell, scratch: &mut Vec<f32>, activity: f32, dt: f64) {
     let Some(g) = cell.genome.as_ref() else {
         return;
     };
@@ -1429,7 +1789,10 @@ fn transcribe(cell: &mut Cell, scratch: &mut Vec<f32>, dt: f64) {
             }
             drive += site.weight * bound.min(1.0);
         }
-        scratch.push(drive.clamp(0.0, 1.0));
+        // The metabolism is throttled by how far the cell has shut down; the
+        // nervous system is not. See above.
+        let throttle = if gene.class.is_signal() { 1.0 } else { activity };
+        scratch.push(drive.clamp(0.0, 1.0) * throttle);
     }
 
     // A daughter whose genome mutated has a proteome the wrong length; she
@@ -1458,16 +1821,49 @@ fn transcribe(cell: &mut Cell, scratch: &mut Vec<f32>, dt: f64) {
 /// `dormancy_power_fraction` of the working one, it breaks even at that much
 /// lower a food concentration -- which is exactly the refuge the population
 /// has never had, and the reason it can outlast a night that would kill it
-/// working.
-fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField, dt: f64) {
+/// working. What it does lose is its machinery: see [`transcribe`].
+///
+/// # Two rules, and only one of them is a rule
+///
+/// A pre-genome cell is governed by the paragraph above, unchanged: below the
+/// line, shut down; above `dormancy_exit` seconds of banked upkeep, wake.
+///
+/// A genome cell is not governed at all. It arrives here with a quiescence
+/// *depth* its own network chose -- anywhere on 0..1, not one of two states --
+/// and this function bills it. Nothing here decides when it shuts down, when
+/// it wakes, or how far it goes, and there is no floor under a cell that
+/// chooses badly. [`CellState::Dormant`] survives only as a label for the
+/// counters and the snapshot, applied to a cell more than half shut down,
+/// which is a reporting threshold and not a state anything reads.
+fn maintain(
+    cell: &mut Cell,
+    cfg: &CellConfig,
+    expression: &Expression,
+    grid: &Grid,
+    heat: &mut HeatField,
+    dt: f64,
+) {
     let working = cell.maintenance(cfg) * dt;
-    if cell.state == CellState::Alive && cell.reserve < working {
-        cell.state = CellState::Dormant;
-    }
-    let due = if cell.state == CellState::Dormant {
-        working * cfg.dormancy_power_fraction
+    let due = if expression.governed {
+        cell.state = if expression.drives.quiesce >= DORMANCY_REPORTED {
+            CellState::Dormant
+        } else {
+            CellState::Alive
+        };
+        // Upkeep at the depth the network chose, plus whatever the cell spent
+        // holding its thrust. Motility goes through the same ledger as
+        // everything else: the reserve pays it and the heat field receives it.
+        working * neural::activity(cfg, expression.drives.quiesce)
+            + neural::motility_cost(cfg, &expression.drives.thrust) * dt
     } else {
-        working
+        if cell.state == CellState::Alive && cell.reserve < working {
+            cell.state = CellState::Dormant;
+        }
+        if cell.state == CellState::Dormant {
+            working * cfg.dormancy_power_fraction
+        } else {
+            working
+        }
     };
 
     // What a cell can endure unpaid. Constant before genomes; for a genome
@@ -1488,13 +1884,23 @@ fn maintain(cell: &mut Cell, cfg: &CellConfig, grid: &Grid, heat: &mut HeatField
     // Waking is a much higher bar than shutting down was. Without the gap a
     // cell on the margin flickers between the two every tick and pays
     // something close to the working bill on average, which is no dormancy at
-    // all.
-    if cell.state == CellState::Dormant
+    // all. A genome cell has no such bar and does not need one -- its neurons
+    // have their own memory, and it is heritable.
+    if !expression.governed
+        && cell.state == CellState::Dormant
         && cell.reserve >= cell.maintenance(cfg) * cfg.dormancy_exit as f64
     {
         cell.state = CellState::Alive;
     }
 }
+
+/// Quiescence at or above which a cell is *reported* as dormant.
+///
+/// Nothing in the lifecycle reads this. Depth is continuous and every bill is
+/// computed from it directly; this exists so that `dormant()`, the population
+/// chart and the snapshot go on meaning what they meant when dormancy was a
+/// state, and half shut down is the only non-arbitrary place to put the line.
+const DORMANCY_REPORTED: f32 = 0.5;
 
 /// How long this particular cell gets, in simulated seconds.
 ///
@@ -1560,11 +1966,16 @@ fn divide(
     // daughter's own gene count, so a point substitution -- which leaves the
     // gene list the same length and in the same order -- carries across
     // exactly, and only genuinely new genes start at zero.
-    let (child_genome, child_proteome) = match &parent.genome {
-        None => (None, Vec::new()),
+    let (child_genome, child_proteome, child_activation) = match &parent.genome {
+        None => (None, Vec::new(), Vec::new()),
         Some(mine) => (
             Some(inherit_genome(mine, cfg, chem, rng, tick, parent.id)),
             parent.proteome.clone(),
+            // Her mother's frame of mind as well as her cytoplasm. A daughter
+            // born in a famine should not open her eyes believing the pond is
+            // full; `sense_and_think` resizes the vector for genes she has
+            // that her mother did not, and those start silent.
+            parent.activation.clone(),
         ),
     };
 
@@ -1582,6 +1993,8 @@ fn divide(
         traits: parent.traits.inherit(cfg, rng, tick, parent.id),
         genome: child_genome,
         proteome: child_proteome,
+        activation: child_activation,
+        quiesce: 0.0,
     }
 }
 
@@ -1631,14 +2044,25 @@ fn decompose(
     cell.radius *= (1.0 - 0.2 * fraction as f32).max(0.0);
 }
 
+/// Drift, swim, and be pushed about.
+///
+/// Three terms, and only one of them is a decision. The water carries the cell
+/// wherever the convection roll is going and Brownian motion jitters it; both
+/// happen to a corpse as readily as to a cell. `thrust` is the third, it comes
+/// from the genome by way of an `Action::Move` effector, and it has already
+/// been paid for -- see `neural::drive`, which clamps it to what the reserve
+/// affords before the cell is allowed to act on it.
+#[allow(clippy::too_many_arguments)]
 fn move_cell(
     cell: &mut Cell,
+    cfg: &CellConfig,
     grid: &Grid,
     flow: &FaceVelocity,
     rng: &Counter,
     tick: u64,
     dt: f64,
     temperature: f32,
+    thrust: &[f32; 3],
 ) {
     let voxel = cell.voxel(grid);
     let (x, y, z) = grid.coords(voxel);
@@ -1653,7 +2077,8 @@ fn move_cell(
     let sigma = (2.0 * diffusion * dt).sqrt() as f32;
     for (axis, &flow_velocity) in velocity.iter().enumerate() {
         let brownian = rng.normal(tick, cell.id, Purpose::Brownian, axis as u64) * sigma;
-        cell.pos[axis] += flow_velocity * dt as f32 + brownian;
+        let swim = thrust[axis] * cfg.swim_speed;
+        cell.pos[axis] += (flow_velocity + swim) * dt as f32 + brownian;
     }
     clamp_position(&mut cell.pos, grid, cell.radius);
 }
@@ -1729,11 +2154,25 @@ mod tests {
     }
 
     /// Particles of every compound in a field, as `introduce` wants them.
+    /// An [`Expression`] carrying no genome's opinion, for the tests that call
+    /// `maintain` directly on a pre-genome cell. `governed: false` is what
+    /// sends it down the Phase 2 path, which is the point of those tests.
+    fn ungoverned() -> Expression {
+        Expression {
+            uptake: Vec::new(),
+            catalysis: Vec::new(),
+            active: Vec::new(),
+            drives: Drives::default(),
+            governed: false,
+            ingest: Vec::new(),
+        }
+    }
+
     /// The [`Expression`] a pre-genome cell reads out. Tests below poke at
     /// `exchange` directly, and it now wants one.
     fn flat(chem: &Chemistry, cell: &Cell, metabolism: Option<ReactionId>) -> Expression {
         let mut e = Expression::new(chem);
-        e.read(cell, metabolism);
+        e.read(cell, &CellConfig::default(), metabolism, 0.01);
         e
     }
 
@@ -1854,7 +2293,8 @@ mod tests {
                 &rng,
                 tick,
                 0.01,
-                20,
+                &Schedule { growth: 20, ..Schedule::default() },
+                &Sensorium::dark(),
                 &mut amounts,
                 &mut residual,
                 &mut heat,
@@ -1904,7 +2344,8 @@ mod tests {
                 &rng,
                 tick,
                 0.01,
-                20,
+                &Schedule { growth: 20, ..Schedule::default() },
+                &Sensorium::dark(),
                 &mut amounts,
                 &mut residual,
                 &mut heat,
@@ -1957,7 +2398,8 @@ mod tests {
                 &rng,
                 tick,
                 0.01,
-                20,
+                &Schedule { growth: 20, ..Schedule::default() },
+                &Sensorium::dark(),
                 &mut amounts,
                 &mut residual,
                 &mut heat,
@@ -2024,7 +2466,8 @@ mod tests {
                     &rng,
                     tick,
                     0.01,
-                    20,
+                    &Schedule { growth: 20, ..Schedule::default() },
+                    &Sensorium::dark(),
                     &mut amounts,
                     &mut residual,
                     &mut heat,
@@ -2074,7 +2517,8 @@ mod tests {
             &rng,
             0,
             0.01,
-            1,
+            &Schedule { growth: 1, ..Schedule::default() },
+            &Sensorium::dark(),
             &mut amounts,
             &mut residual,
             &mut heat,
@@ -2113,6 +2557,8 @@ mod tests {
             traits: Traits::default(),
             genome: None,
             proteome: Vec::new(),
+            activation: Vec::new(),
+            quiesce: 0.0,
         };
         let dt = 0.01;
         let opening = cell.reserve;
@@ -2121,7 +2567,7 @@ mod tests {
             let pay = cfg.maintenance_power * dt * income;
             cell.reserve += pay;
             earned += pay;
-            maintain(&mut cell, cfg, &grid, &mut heat, dt);
+            maintain(&mut cell, cfg, &ungoverned(), &grid, &mut heat, dt);
         }
         (cell, heat, opening + earned)
     }
@@ -2205,11 +2651,13 @@ mod tests {
             traits: Traits::default(),
             genome: None,
             proteome: Vec::new(),
+            activation: Vec::new(),
+            quiesce: 0.0,
         };
 
         let mut shut_down_at = None;
         for tick in 0..1_000 {
-            maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+            maintain(&mut cell, &cfg, &ungoverned(), &grid, &mut heat, 0.01);
             if shut_down_at.is_none() && cell.state == CellState::Dormant {
                 shut_down_at = Some(tick);
                 assert_eq!(cell.damage, 0.0, "took damage before shutting down");
@@ -2238,12 +2686,12 @@ mod tests {
 
         // A windfall short of the waking threshold leaves it shut down.
         cell.reserve = cfg.maintenance_power * 59.0;
-        maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+        maintain(&mut cell, &cfg, &ungoverned(), &grid, &mut heat, 0.01);
         assert_eq!(cell.state, CellState::Dormant);
 
         // One that clears it puts the cell back to work.
         cell.reserve = cfg.maintenance_power * 61.0;
-        maintain(&mut cell, &cfg, &grid, &mut heat, 0.01);
+        maintain(&mut cell, &cfg, &ungoverned(), &grid, &mut heat, 0.01);
         assert_eq!(cell.state, CellState::Alive);
     }
 
@@ -2269,7 +2717,21 @@ mod tests {
         );
         let before = p.births;
         p.step(
-            &cfg, &grid, &chem, &flow, &rng, 0, 0.01, 1, &mut amounts, &mut residual, &mut heat,
+            &cfg,
+            &grid,
+            &chem,
+            &flow,
+            &rng,
+            0,
+            0.01,
+            &Schedule {
+                growth: 1,
+                ..Schedule::default()
+            },
+            &Sensorium::dark(),
+            &mut amounts,
+            &mut residual,
+            &mut heat,
         );
         assert_eq!(p.births, before, "a dormant cell divided");
     }
@@ -2479,7 +2941,8 @@ mod tests {
                 &rng,
                 tick,
                 0.01,
-                20,
+                &Schedule { growth: 20, ..Schedule::default() },
+                &Sensorium::dark(),
                 &mut amounts,
                 &mut residual,
                 &mut heat,
@@ -2625,6 +3088,223 @@ mod tests {
         // move the mean on its own and read as evolution.
         p.cells[0].state = CellState::Decomposing;
         assert_eq!(p.trait_summary().mean_uptake, 1.0);
+    }
+
+    /// One genome cell in a small pond, its network run to steady state at a
+    /// given reserve.
+    ///
+    /// The reserve is *held* rather than spent: what is being measured is what
+    /// the network decides at that reserve, not how long the cell survives.
+    fn opinion_at(reserve_seconds: f64) -> (Cell, Drives) {
+        let (mut cfg, grid, chem, rng, amounts, ..) = setup();
+        cfg.genome = true;
+        cfg.founder_divergence = 0;
+        cfg.mutation = MutationRates::none();
+        let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+        let mut cell = p.cells.remove(0);
+        let mut expression = Expression::new(&chem);
+        let mut levels = Vec::new();
+        let mut signals = Vec::new();
+        let world = neural::Surroundings {
+            amounts: &amounts,
+            voxel: cell.voxel(&grid),
+            voxel_volume: grid.voxel_volume() as f64,
+            brightness: 0.0,
+            temperature: 293.15,
+            crowd: 1,
+            lifespan: cfg.maximum_age,
+        };
+        // Long enough for the proteome to reach its basal levels and the
+        // neuron to settle: the ancestor's slowest protein turns over at
+        // 0.05/s and its neuron forgets at 0.3/s.
+        for _ in 0..40_000 {
+            cell.reserve = cfg.maintenance_power * reserve_seconds;
+            neural::sense_and_think(&mut cell, &cfg, &world, &mut signals, true, 0.01);
+            expression.read(&cell, &cfg, None, 0.01);
+            let activity = neural::activity(&cfg, expression.drives.quiesce) as f32;
+            transcribe(&mut cell, &mut levels, activity, 0.01);
+        }
+        (cell, expression.drives)
+    }
+
+    #[test]
+    fn the_ancestor_decides_to_sleep_when_it_is_hungry_and_not_when_it_is_not() {
+        // The circuit, end to end: a receptor on the reserve, a neuron that
+        // reads it, an effector that shuts the cell down. Nothing in the cell
+        // layer decides any of this -- delete the effector gene and the cell
+        // simply never sleeps.
+        let (_, rich) = opinion_at(2_000.0);
+        let (_, poor) = opinion_at(0.0);
+        assert!(
+            rich.quiesce < 0.05,
+            "a cell with two thousand seconds in the bank shut down anyway ({:.3})",
+            rich.quiesce
+        );
+        assert!(
+            poor.quiesce > 0.8,
+            "a cell with nothing left kept paying full price ({:.3})",
+            poor.quiesce
+        );
+        // And the division brake rides on the same signal.
+        assert!(rich.divide, "a well-fed cell refused to divide");
+        assert!(!poor.divide, "a starving cell was still willing to divide");
+    }
+
+    #[test]
+    fn the_decision_is_graded_and_not_a_switch() {
+        // The whole reason this is a network and not a threshold. A rule gives
+        // every cell the same answer at the same moment; a squashed sum gives
+        // a curve, and a curve is what a mutation can move a little way along.
+        let depths: Vec<f32> = [500.0, 100.0, 60.0, 40.0, 20.0, 0.0]
+            .iter()
+            .map(|&r| opinion_at(r).1.quiesce)
+            .collect();
+        for pair in depths.windows(2) {
+            assert!(
+                pair[1] >= pair[0] - 1.0e-6,
+                "quiescence did not increase as the reserve fell: {depths:?}"
+            );
+        }
+        assert!(
+            depths.iter().any(|&d| d > 0.05 && d < 0.95),
+            "the response has no middle in it, only on and off: {depths:?}"
+        );
+    }
+
+    #[test]
+    fn sleeping_costs_the_machinery_it_saves_on() {
+        // Quiescence has to be a trade or the only stable strategy is
+        // permanent sleep -- which is very nearly what the hardcoded version
+        // produced, and exactly what a pond of cells that never wake looks
+        // like. A cell that stops paying stops synthesising, so it loses the
+        // transporters and enzymes it was living on and has to build them
+        // again before it can earn anything.
+        let (rich, _) = opinion_at(2_000.0);
+        let (poor, _) = opinion_at(0.0);
+        assert!(
+            poor.uptake() < 0.25 * rich.uptake(),
+            "a shut-down cell kept its transporters: {:.3} against {:.3}",
+            poor.uptake(),
+            rich.uptake()
+        );
+        // Not as far, and deliberately: the nervous system transcribes at
+        // full level whatever the depth, because a cell that shut down its own
+        // receptors could never wake. It is still on the bill.
+        assert!(
+            poor.machinery() < 0.75 * rich.machinery(),
+            "a shut-down cell kept its whole proteome: {:.3} against {:.3}",
+            poor.machinery(),
+            rich.machinery()
+        );
+    }
+
+    #[test]
+    fn the_ancestor_costs_about_what_it_used_to() {
+        // `PROTEOME_REFERENCE` is what a genome cell's upkeep is normalised
+        // by, so it has to be measured off the ancestor rather than chosen.
+        // It was 4.0 before the ancestor had a nervous system; four more
+        // proteins to keep is a third again on the bill, and leaving it would
+        // have charged every genome cell for the privilege of being able to
+        // decide anything.
+        let (cell, _) = opinion_at(2_000.0);
+        let machinery = cell.machinery();
+        assert!(
+            (0.85..1.15).contains(&machinery),
+            "the ancestor's upkeep is {machinery:.3} times `maintenance_power`, \
+             so `PROTEOME_REFERENCE` is off by that factor"
+        );
+    }
+
+    #[test]
+    fn founders_are_relatives_rather_than_copies() {
+        // Sixteen founders one division from the ancestor are eight or nine
+        // distinct genomes differing by a byte, which is a cohort of clones
+        // with a rounding error. Selection has nothing to act on until
+        // mutation supplies some, mutation is per-division, and a population
+        // that never gets going never divides -- which is most of why the
+        // first genome runs froze.
+        let (mut cfg, grid, chem, rng, amounts, ..) = setup();
+        cfg.genome = true;
+        cfg.initial_count = 16;
+        let diverged = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+
+        cfg.founder_divergence = 0;
+        let clones = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
+
+        let lines = |p: &Population| p.trait_summary().distinct_genomes;
+        assert!(
+            lines(&diverged) > lines(&clones),
+            "divergence bought no lineages: {} against {}",
+            lines(&diverged),
+            lines(&clones)
+        );
+        assert!(
+            lines(&diverged) >= cfg.initial_count * 3 / 4,
+            "only {} distinct genomes out of {} founders",
+            lines(&diverged),
+            cfg.initial_count
+        );
+        // Still relatives, not noise: they all descend from an ancestor that
+        // works, and a cohort that had lost its metabolism would be a
+        // divergence rate that is really an extinction rate.
+        let feeding = diverged
+            .cells
+            .iter()
+            .filter(|c| {
+                c.genome
+                    .as_ref()
+                    .is_some_and(|g| g.targets.iter().any(|t| !t.reactions.is_empty()))
+            })
+            .count();
+        assert!(
+            feeding >= diverged.cells.len() * 3 / 4,
+            "only {feeding} of {} founders can still eat",
+            diverged.cells.len()
+        );
+    }
+
+    #[test]
+    fn a_genome_cell_takes_its_own_quiescence_out_of_the_same_ledger() {
+        // Dormancy at a depth rather than in a state, but the energy still has
+        // to arrive in the heat field. A hole here is a hole in the audit.
+        let (cell, drives) = opinion_at(0.0);
+        let cfg = CellConfig {
+            genome: true,
+            ..CellConfig::default()
+        };
+        let grid = Grid::new(2, 2, 2, 25.0e-6);
+        let mut heat = HeatField::new(&grid, 293.15);
+        let mut cell = cell;
+        cell.reserve = cfg.maintenance_power * 1000.0;
+        let mut expression = ungoverned();
+        expression.governed = true;
+        expression.drives = drives;
+
+        let before = cell.reserve;
+        let dt = 0.01;
+        for _ in 0..500 {
+            maintain(&mut cell, &cfg, &expression, &grid, &mut heat, dt);
+        }
+        let spent = before - cell.reserve;
+        let arrived = heat.energy(&grid);
+        assert!(spent > 0.0, "a shut-down cell paid nothing at all");
+        assert!(
+            (spent - arrived).abs() < spent.abs() * 1.0e-9,
+            "{spent:e} J left the reserve and {arrived:e} J arrived as heat"
+        );
+        // And it is genuinely cheaper than working.
+        let mut awake = ungoverned();
+        awake.governed = true;
+        let mut twin = cell.clone();
+        twin.reserve = before;
+        let mut heat2 = HeatField::new(&grid, 293.15);
+        for _ in 0..500 {
+            maintain(&mut twin, &cfg, &awake, &grid, &mut heat2, dt);
+        }
+        assert!(
+            spent < (before - twin.reserve) * 0.5,
+            "shutting down did not lower the bill"
+        );
     }
 
     #[test]
