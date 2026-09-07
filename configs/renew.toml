@@ -1,0 +1,184 @@
+# The gate pond, on the living it actually has.
+#
+# Physically this is `gate.toml` -- same seed, same chemistry, same sun, same
+# vents, same grid, same lifecycle numbers. One line differs, and it is the
+# line that says what the ancestors eat.
+#
+#     hadean ecology --config configs/renew.toml --ticks 250000
+#
+# Every run this project has done was handed `H2 + CH2O2S -> H2O + CH2OS`,
+# because `choose_metabolism` ranked livings by how much of the substrate the
+# pond was holding and the pond was holding 1.15e13 particles of CH2O2S. That
+# is a larder. `hadean supply` measures the other column -- it settles a
+# lifeless pond, takes a compound out of it, and then keeps taking every
+# particle the chemistry makes of it, so what comes back is the largest
+# harvest the world will sustain:
+#
+#     hadean supply --config configs/gate.toml --probe 600
+#
+#     compound       standing      opening    sustained  holding
+#     HM              4.621e11   1.208e10/s   1.206e10/s    0.998  renewed
+#     HO2M            1.854e10    6.913e9/s    8.512e9/s    1.231  renewed
+#     CH2O2S          1.150e13    3.048e9/s    1.027e7/s    0.003  larder
+#
+#     4.554e-9 W    455 cells  HO2M + HM <=> 2 HOM
+#     8.387e-13 W     0 cells  H2 + CH2O2S <=> H2O + CH2OS
+#
+# The pond holds six hundred times more CH2O2S than HO2M and rebuilds eight
+# hundred times less of it. Ranked by standing amount the ancestor was given
+# the first; ranked by what the world can resupply it should have had the
+# second, which is worth five thousand times as much sustainable power and is
+# the difference between a pond with a carrying capacity and a pond without
+# one. HM is a vent fuel, which is why the probe measures its resupply at
+# 1.206e10/s against the 1.2e10/s the config states outright -- `vents = 3`
+# times `fuel_rate = 4.0e9`. That agreement is the instrument checking itself
+# against the one rate in this world that was never in doubt.
+#
+#   metabolism = "HO2M + HM"
+#                            Named rather than chosen, because measuring a
+#                            resupply rate costs one settled lifeless world per
+#                            candidate substrate and a run cannot afford that
+#                            at the moment its ancestors arrive. The
+#                            measurement is taken once with the instrument and
+#                            written down here, the same way `enzyme_sigma` was
+#                            measured with `chem --keys` and written into
+#                            `evolve.toml`.
+#
+# The lifecycle numbers are NOT `gate.toml`'s. Carrying them over was tried
+# first, because it is the control, and it fails: the cohort shuts down on the
+# tick it arrives and starves by t = 600. HANDOFF.md item 2 has been saying not
+# to trust them across a change of food chain since before there was one, and
+# this is the change of food chain.
+#
+# What it took to find that out is worth the four lines below being explained
+# rather than just set. `membrane_scale` was swept thirty-fold and
+# `metabolic_rate` twenty-fold -- eight runs, sixteen cells shut down in every
+# one of them. The four `metabolic_rate` runs are byte-identical in every
+# logged column; the four `membrane_scale` runs differ only in the fourth digit
+# of the food column. Two dials that inert are not a tuning problem. They mean
+# the quantity being tuned is not the one that binds:
+#
+#     CH2O2S (the larder diet)   1.997e9/voxel -> 3.425e7 in a cell -> 5.590 x upkeep
+#     HO2M   (the renewed diet)  3.212e6/voxel -> 5.511e4 in a cell -> 0.059 x upkeep
+#
+# A passive membrane equilibrates; it does not concentrate. At the steady state
+# of `exchange`, `inside / cell_volume == outside / voxel_volume`, so a cell
+# holds its own volume's share of what the water holds and no `membrane_scale`
+# changes that number -- a bigger membrane only reaches the same equilibrium
+# sooner. Six hundred times less substrate in the water is six hundred times
+# less inside the cell, and six and a half times more energy per turnover does
+# not cover it. That is a third sense of "food": `hadean supply` measures what
+# the *pond* produces, and a cell is a point consumer in a dilute field. Both
+# bounds are real and a living has to clear both. `hadean_cell::subsistence` is
+# the second one and `ecology` prints it before the run now.
+#
+#   membrane_scale = 1.0e4   Where the sweep showed it stops mattering. Below
+#   metabolic_rate = 500.0   about 1e4 the cell cannot even reach equilibrium
+#                            with the water before it starves; above it,
+#                            nothing changes. These are floors, not
+#                            measurements, and should be treated as such.
+#
+#   maintenance_power = 1e-13   The measurement, scaled. A newborn earns about
+#                            5.9e-13 W on this diet, so at `gate.toml`'s 1e-11
+#                            it is ninety-five times short. Confirmed against
+#                            the world rather than assumed: at 1e-11 all
+#                            sixteen cells are dormant, at 1e-12 the pond is
+#                            mixed and flickering, and at 1e-13 and below
+#                            nothing is dormant at all.
+#
+#   division_reserve = 3e-11 Against a `turnover_budget` of 6e-11, so a cell a
+#                            standard deviation above the margin can fund a
+#                            daughter -- which is the pre-run check in
+#                            `ecology`, and it is worth watching it work: at
+#                            1e-10 against the same budget the check says only
+#                            the far tail could, and the population duly sits
+#                            at sixteen for four hundred seconds.
+#
+# `population_cap` is the thing to watch here and it has not been re-sized. At
+# `maintenance_power = 1e-13` the pond's 4.554e-9 W supports of order 45 000
+# cells, which is the same order as the cap. A run that touches the cap proves
+# nothing by construction, and this one gets closer to it than any run in this
+# project ever has.
+#
+# The control for every claim here is `gate.toml`, which is this file eating
+# the larder on the numbers that suit a larder.
+
+name = "renew"
+seed = 1
+dt = 0.01
+
+[grid]
+nx = 24
+ny = 24
+nz = 10
+dx = 2.5e-5
+
+[schedule]
+physics = 1
+chemistry = 1
+transport = 1
+neural = 1
+expression = 10
+growth = 20
+development = 50
+phylogeny = 500
+audit = 100
+
+[chemistry]
+n_compounds = 32
+n_reactions = 240
+max_skeleton = 4
+ea_min_zj = 6.0
+ea_max_zj = 160.0
+rate_min = 0.1
+rate_max = 10000.0
+addition_fraction = 0.3
+absorption_scale = 4000.0
+photo_yield = 0.35
+n_photo = 2
+
+[light]
+irradiance = [40.0, 70.0, 95.0, 110.0, 105.0, 85.0, 55.0, 30.0]
+medium_extinction = [220.0, 260.0, 300.0, 350.0, 420.0, 520.0, 650.0, 820.0]
+day_length = 600.0
+
+[heat]
+ambient = 293.15
+sky = 289.15
+surface_transfer = 60.0
+vent_power = 2.0e-9
+vents = 3
+
+[flow]
+speed = 2.0e-5
+rolls = 2
+
+[vents]
+fuel_rate = 4.0e9
+fuel_species = 2
+
+[initial]
+water = 2.0e11
+primordial = 2.0e9
+noise = 0.25
+
+[cells]
+enabled = true
+metabolism = "HO2M + HM"
+initial_count = 16
+population_cap = 60000
+birth_radius = 4.0e-6
+membrane_scale = 1.0e4
+metabolic_rate = 500.0
+capture_efficiency = 0.6
+maintenance_power = 1.0e-13
+division_reserve = 3.0e-11
+starvation_time = 300.0
+maximum_age = 2400.0
+lifespan_spread = 0.4
+trait_spread = 0.5
+trait_cost = 0.5
+dormancy_power_fraction = 0.05
+dormancy_exit = 60.0
+decomposition_rate = 0.8
+seed_delay = 150.0

@@ -19,3 +19,4 @@ hadean-sim = { workspace = true }
 hadean-analysis = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }

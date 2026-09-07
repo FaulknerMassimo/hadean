@@ -30,87 +30,97 @@ cell's lifecycle.
 - Headless CLI, compressed snapshots, replay verification, CSV telemetry
 - Population-curve analysis: boom, bust and recovery read out of a run rather
   than asserted
+- `hadean supply`: what the pond can *resupply*, measured rather than guessed
+  — it settles a lifeless world, takes a compound out of it, and keeps taking
+  every particle the chemistry makes of it, so what comes back is the largest
+  harvest the world will sustain
 
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
-place and the energetics are sized against the pond's measured photochemical
-output. **The gate is not met**, and the reason has moved three times.
+place. **The gate is not met**, and the reason has moved four times — the first
+three were the cell, and the fourth was not.
 
 It was thought to be a famine, and it was ageing: every cell died at exactly
 the same age, so the cohort that boomed together aged out together. Individual
 lifespans fixed that. Then it was that nothing was ever born after the boom —
 a hundred and thirty-six identical clones in a shared pond all break even at
 the same concentration and freeze there, and a population that never breeds
-cannot recover. Cells now carry a heritable trait, so they differ in what they
-need and the pond can select between them. It helps: the plateau rises from 136
-to 156 and the first runs finish with survivors rather than extinct. It is not
-enough on its own, and how much variation would be enough turns out to be an
-inequality you can check before starting a run.
+cannot recover. Cells now carry a heritable trait, and then a genome, so they
+differ in what they need and the pond can select between them. Then it was
+dormancy: when to shut down and when to wake were two numbers in `CellConfig`
+read by every cell in the pond, so the population could not disagree with
+itself — it shut down as one and waited for a bar that was unreachable for all
+of it at once. Those are now a receptor, a neuron and an effector in each
+cell's own genome, and half a pond can sleep while the other half works.
 
-Underneath both, the food column says something neither of those explanations
-reached. Over four days the larder falls from 1.15e13 particles to 1e9, in
-every configuration, at almost exactly the same rate whether the pond carries
-136 cells or 156 — while a pond containing one cell that cannot eat holds it
-flat. This population is not failing to regulate. Its food is made from CO2,
-CO2 takes part in exactly one reaction in this chemistry, and the waste it
-excretes has no way back: it is **mining a finite pool**. A boom, a bust and a
-recovery need a renewable resource, and this world does not have one for this
-metabolism. HANDOFF.md has the measurements and what to do about it.
+Each of those was real and none of them was it. The thing they were all
+downstream of is that **the pond had no carrying capacity, because the
+ancestors were eating the wrong thing.**
 
-So the genome arrived early, out of order, because the diagnosis pointed at it.
-The pre-genome cell has one heritable number and *every cell in the pond
-catalyses the same reaction*, chosen once and fixed for the run — which is the
-mechanism underneath the mining. A population that can only ever eat one thing
-cannot respond to that thing running out. With a genome, what a cell eats is an
-enzyme, an enzyme is eight bytes matched against the reaction network, and
-daughters differ from their mothers.
+`choose_metabolism` ranked candidate livings by how much of the substrate the
+pond was holding. That is a larder, not an income, and nothing here had ever
+measured an income. `hadean supply` does: it settles a lifeless pond, takes one
+compound out of it, and then keeps taking every particle the chemistry makes of
+it, so what has to be removed each second is the largest harvest the world will
+ever support. Held against the vents — whose flux the config states outright at
+1.2e10 particles per second — the instrument measures 1.206e10/s, which is it
+checking itself against the one rate in this world that was never in doubt.
 
-The pond has a way out and does not use it: `O2 + CH2OS -> CH2O3S` is downhill
-and has a rate constant of 8e-15, which is no route at all. Lowering a barrier
-is precisely and only what an enzyme does, so a lineage that evolves onto that
-reaction is a decomposer, and a pond with a decomposer in it recycles its
-carbon instead of retiring it. That is the mechanism.
+On seed 1 it says:
 
-**No run has found it, and the runs so far cannot.** A genome adapts across
-generations, and on seed 1 the population only ever gets one: it booms into the
-larder, and then either no cell at the margin can afford a daughter or the
-whole plateau is shut down dormant, depending on which way `division_reserve`
-is turned. Both ends give a single generation, because births balancing deaths
-is what a carrying capacity is and this pond has none. The genome is not
-blocked by anything in the genome; it is queued behind the renewable living
-that was already the outstanding problem. What the runs do show is that the
-machinery works under load — 617 lineages against a clone control's 1, standing
-variation of 0.357 against exactly 0.000, and an energy audit flat to 5e-11
-across two thousand cells.
+```
+  compound     standing      opening    sustained  holding
+  HM            4.621e11   1.208e10/s   1.206e10/s    0.998  renewed
+  HO2M          1.854e10    6.913e9/s    8.512e9/s    1.231  renewed
+  CH2O2S        1.150e13   3.048e9/s    1.027e7/s    0.003  larder
+```
 
-The dormant half of that was its own problem and has been fixed at the root,
-which the runs now show and which did not, on its own, unblock the gate.
-When to shut down and when to wake used to be two numbers in `CellConfig`, read
-by every cell in the pond, so the population could not disagree with itself: it
-shut down at the same instant and waited for the same unreachable bar. They are
-now a receptor, a neuron and an effector in each cell's own genome, quiescence
-is a depth on 0..1 rather than one of two states, and the hysteresis that dial
-provided comes from a neuron's heritable rate of forgetting. Sleeping deeply
-but briefly and lightly but long are things a lineage *is*. Sleep is also no
-longer free — a shut-down cell stops synthesising and loses the transporters it
-was living on — so permanent dormancy is a strategy the pond can select
-against. It is the third time a population here died as one and the third time
-the cause was a number that should have been per-cell.
+`CH2O2S` is what every run in this project was handed. The pond holds six
+hundred times more of it than of `HO2M` and rebuilds eight hundred times less.
+Ranked by amount the ancestor gets a stock of ten million meals with nothing
+behind it; ranked by rate it should have had `HO2M + HM -> 2 HOM`, which
+sustains 4.554e-9 W where the ancestral reaction sustains 8.4e-13 — **a factor
+of five thousand in the living the pond can actually pay.**
 
-The measurement: at t = 1539 s of an `evolve.toml` run, 78 of 156 cells were
-shut down at a mean depth of 0.45 — half the pond asleep and half awake in the
-same water, where every earlier reading of that column was 0% or 100%. Peak
-population 157 against 141, seventy-five clone lines against forty-nine, and
-signal genes per cell *rising* from 4.1 to 5.1 as the population was culled, so
-the nervous system is being kept rather than shed. Births after the peak are
-still zero at `division_reserve = 1e-8`, because that was never dormancy: the
-population's measured spread will fund 3.11e-9 J and a daughter costs 1e-8.
-At 4e-10 — the setting where the pond used to go 100% dormant and never wake —
-238 of 2095 cells are awake and working through a shortage that shut the rest
-down, and the run records **three births after the peak against a previous
-zero**. Both runs still end extinct, because the pond still has no renewable
-living. That is the outstanding problem above and it was the outstanding
-problem before.
+That also settles the `division_reserve` question underneath it. Swept over
+four and a half octaves, the dial buys peak population and nothing else: the
+peak scales inversely with it, `births` comes out equal to the peak at every
+point, and births after the peak are zero at four of five. One generation, five
+times over, because births balancing deaths is what a carrying capacity is and
+there wasn't one.
+
+There is a third sense of "food" and it caught the first attempt to eat the
+renewable one. `configs/renew.toml` is `gate.toml` with that single line
+changed, and on the carried-over lifecycle numbers the cohort shut down on the
+tick it arrived. `membrane_scale` was swept thirty-fold and `metabolic_rate`
+twenty-fold — eight runs, sixteen cells shut down in every one, the four
+`metabolic_rate` runs byte-identical and the four `membrane_scale` runs
+differing only in the fourth digit of the food column.
+Two dials that inert mean the quantity being tuned is not the one that binds:
+**a passive membrane equilibrates, it does not concentrate**, so a cell holds
+its own volume's share of what the water holds and no amount of membrane
+changes that number. Six hundred times less substrate in the water is six
+hundred times less inside the cell, and a newborn earned 0.059 of its own
+upkeep. `hadean_cell::subsistence` is that arithmetic, and `ecology` now prints
+it the moment the metabolism is settled — a microsecond for what those eight
+runs took half an hour to say.
+
+Re-tuned against the diet rather than carried over — the cell's whole energy
+budget down two orders, which HANDOFF.md has been warning a change of food
+chain would demand — the ancestors divide. Sixteen cells to a peak of 17 333,
+and then **193 births after that peak**. Every run in this project's history
+had recorded zero in that column, except one that recorded three; it is the
+leg of the gate that has been missing from the start. The food column changes
+character with it: under the larder every night's rebuild reached a tenth of
+the last one, four orders down and never up, and here it falls to 2.4e3 and is
+back at 5.2e6 ten thousand ticks later.
+
+**The gate is still not met**, and the reason is now dull rather than deep:
+both runs were *still crashing when the clock ran out*. Growing into a supply
+takes seven times longer than sprinting through a stock, so the peak lands at
+tick 187 000 where the larder's landed at 26 000, and 250 000 ticks — a run
+length calibrated against the other pond — does not reach the far side. A
+longer horizon is the next thing, rather than a mechanism that does not exist.
 
 `configs/evolve.toml` is the gate pond with the genome switched on; a test
 enforces that the two differ in nothing but the cell. `cells.genome` is off by
@@ -139,6 +149,8 @@ mise exec -- cargo run -p hadean-headless --release -- ecology \
   --config configs/gate.toml --ticks 250000
 mise exec -- cargo run -p hadean-headless --release -- ecology \
   --config configs/evolve.toml --ticks 250000
+mise exec -- cargo run -p hadean-headless --release -- supply \
+  --config configs/gate.toml --probe 600
 mise exec -- cargo run -p hadean-headless --release -- chem --keys
 mise exec -- cargo test --release --workspace
 ```
@@ -152,6 +164,14 @@ without ever leaning on the safety cap.
 Runs can emit audit/population telemetry with `--csv runs/pond.csv` and resume
 bit-identically through `--out runs/pond.snap` / `--resume runs/pond.snap`.
 
+`supply` is the measurement behind what the ancestors are given to eat. Every
+earlier answer to that question was an amount — is this compound reachable, is
+it one hop from sunlight, is there a lot of it — and all three picked a pool
+the pond cannot refill. This one is a rate, and it is taken by perturbing the
+world rather than by reading its graph: take the compound away, keep taking it,
+and see what the chemistry does about it. Its answer goes into a config as
+`cells.metabolism`, the same way `chem --keys` sets `enzyme_sigma`.
+
 `chem --keys` is the measurement behind the genome's recognition widths: it
 reports how far apart the chemistry's affinity keys actually are, and how many
 reactions one enzyme reaches at each width. The first widths in this project
@@ -163,7 +183,9 @@ world at an eighth of the volume, which is where the population gate is tuned
 and where it runs in twenty minutes rather than an afternoon. Everything but
 the grid and the cell lifecycle numbers is identical, and a test enforces that.
 `configs/evolve.toml` is `gate.toml` with the genome on and nothing else
-changed, enforced by another.
+changed, enforced by another. `configs/renew.toml` is `gate.toml` eating the
+living the pond can actually resupply, which is one line, and its lifecycle
+numbers re-measured against that diet, which is four more.
 
 ## The sun has to move
 

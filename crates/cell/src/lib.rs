@@ -61,10 +61,31 @@ pub use genome::{Genome, MutationRates, ProteinClass};
 pub use neural::{Action, Channel, Drives};
 
 /// Tunables for the hand-authored ancestor used before genomes exist.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CellConfig {
     pub enabled: bool,
+    /// The reaction the founding cohort is given, named by its substrates --
+    /// `"HO2M + HM"`. `None` lets [`choose_metabolism`] pick.
+    ///
+    /// This is here because the right way to choose a metabolism costs a
+    /// measurement the run itself cannot afford. Ranking livings correctly
+    /// means ranking them by *resupply rate*, and reading a resupply rate off
+    /// a world with this much coupling in it means taking a compound out of a
+    /// settled pond and watching what the chemistry does about it -- one
+    /// probe per candidate substrate, which is `hadean supply` and which costs
+    /// more world time than the run it would be informing.
+    ///
+    /// So the measurement is taken once with the instrument and its answer is
+    /// written down, exactly as `enzyme_sigma` is. A config that sets this
+    /// should name the command that found it, and quote the two numbers that
+    /// justify it: the sustained watts and the cells they keep alive.
+    ///
+    /// It is not a way to hand the population a living it has not earned. What
+    /// it names still has to be an exergonic thermal reaction whose substrates
+    /// are standing in the water, and the cell still has to take them across a
+    /// membrane and pay for everything it does with them.
+    pub metabolism: Option<String>,
     pub initial_count: usize,
     pub population_cap: usize,
     /// Radius just after division, metres.
@@ -322,6 +343,7 @@ impl Default for CellConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            metabolism: None,
             initial_count: 24,
             population_cap: 60_000,
             birth_radius: 4.0e-6,
@@ -810,7 +832,13 @@ impl Population {
             return;
         }
         if self.metabolic_reaction.is_none() {
-            self.metabolic_reaction = choose_metabolism(chem, abundance, grid.len());
+            self.metabolic_reaction = match &cfg.metabolism {
+                // A measured living, named in the config. `named_metabolism`
+                // is checked at world construction, so a bad name has already
+                // failed the run rather than silently falling back here.
+                Some(spec) => named_metabolism(chem, spec).ok(),
+                None => choose_metabolism(chem, abundance, None, grid.len()),
+            };
         }
         if self.metabolic_reaction.is_none() {
             return;
@@ -1258,9 +1286,90 @@ const FOOD_FLOOR: f64 = hadean_core::units::N_REF as f64 * 1.0e-4;
 /// `None` when no downhill reaction runs on anything the pond holds. Not every
 /// generated world offers a living, and saying so is better than handing over
 /// a metabolism that never turns over.
-pub fn choose_metabolism(chem: &Chemistry, abundance: &[f64], voxels: usize) -> Option<ReactionId> {
+///
+/// # It has now been wrong four times, and the fourth is measured
+///
+/// The three corrections above are all the same correction -- stop trusting
+/// something that merely *looks* like food -- and the third did not go far
+/// enough. A standing stock is not a living either, and on seed 1 the gap
+/// between those two readings is the whole Phase 2 problem.
+///
+/// `hadean supply` settles a lifeless pond, takes one compound out of it, and
+/// then keeps taking every particle the chemistry makes of it, which measures
+/// the largest harvest the world will sustain. On `gate.toml` it reports:
+///
+/// ```text
+///   compound       standing      opening    sustained  holding
+///   HM              4.621e11   1.208e10/s   1.206e10/s    0.998  renewed
+///   HO2M            1.854e10    6.913e9/s    8.512e9/s    1.231  renewed
+///   CH2O2S          1.150e13    3.048e9/s    1.027e7/s    0.003  larder
+/// ```
+///
+/// `CH2O2S` is what this function picked, because the pond holds 1.15e13 of
+/// it. It is resupplied at *ten million particles a second* and the pond holds
+/// six hundred times less `HO2M`, which is resupplied at eight billion. Rank
+/// those two by amount and you get the answer this function gave for six
+/// months of runs; rank them by rate and the order inverts:
+///
+/// ```text
+///   4.554e-9 W    455 cells  HO2M + HM <=> 2 HOM        <- what the pond feeds
+///   8.387e-13 W     0 cells  H2 + CH2O2S <=> H2O + CH2OS <- what it was given
+/// ```
+///
+/// A factor of five thousand in sustainable power, and the founding cohort was
+/// handed the wrong one. That is the mechanism under "the population is mining,
+/// not grazing": not a badly tuned cell, a metabolism chosen off the wrong
+/// column.
+///
+/// So `supply` is the argument that matters, and with it the ranking is a
+/// power in watts -- directly comparable against `maintenance_power`, which
+/// makes the quotient a carrying capacity in cells. That number is what every
+/// run before this one lacked.
+///
+/// Passing `None` keeps the standing-amount rule exactly as it was, because it
+/// is the pre-genome control's arithmetic and has to stay bit-identical.
+pub fn choose_metabolism(
+    chem: &Chemistry,
+    abundance: &[f64],
+    supply: Option<&[f64]>,
+    voxels: usize,
+) -> Option<ReactionId> {
     let floor = FOOD_FLOOR * voxels.max(1) as f64;
     let held = |c: u16| abundance.get(c as usize).copied().unwrap_or(0.0);
+
+    // With a measured resupply rate in hand the ranking is a power, in watts,
+    // and the pond's answer changes completely. Without one it is a quantity
+    // of energy standing in the water, which is a larder -- kept because it is
+    // the pre-genome control's arithmetic and has to stay bit-identical, not
+    // because it is right. See the doc comment above.
+    if let Some(supply) = supply {
+        let rate = |c: u16| supply.get(c as usize).copied().unwrap_or(0.0);
+        return chem
+            .reactions
+            .iter()
+            .filter(|r| r.drive == Drive::Thermal && r.dh < 0.0)
+            .filter_map(|r| {
+                // A reaction turns over no faster than its scarcest substrate
+                // is *resupplied*. Standing stock does not enter: a pond can
+                // hold four orders of magnitude more of a compound it cannot
+                // make than of one it makes continuously, and on seed 1 it
+                // does.
+                let turnovers = r
+                    .reactants
+                    .iter()
+                    .map(|&(c, n)| rate(c) / n.max(1) as f64)
+                    .fold(f64::INFINITY, f64::min);
+                // Still require the substrates to be *present*, not only
+                // resupplied. A compound arriving at a healthy rate and
+                // consumed as fast as it arrives is a real living, but a
+                // cohort dropped into a pond holding none of it starves before
+                // the first delivery.
+                let stocked = r.reactants.iter().all(|&(c, _)| held(c) >= floor);
+                (turnovers > 0.0 && stocked).then(|| (r.id, turnovers * -r.dh))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id);
+    }
 
     chem.reactions
         .iter()
@@ -1283,6 +1392,138 @@ pub fn choose_metabolism(chem: &Chemistry, abundance: &[f64], voxels: usize) -> 
         })
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(id, _)| id)
+}
+
+/// What one newborn cell could earn on a diet, as a multiple of its upkeep.
+///
+/// Below one, the founding cohort cannot pay its own maintenance on the food
+/// the pond is holding, and the run is over before it starts -- the cohort
+/// shuts down on the tick it arrives, banks nothing, and dies of starvation a
+/// `starvation_time` later.
+///
+/// # Why this is not `membrane_scale`'s problem, or `metabolic_rate`'s
+///
+/// **A passive membrane equilibrates; it does not concentrate.** At the
+/// steady state of `exchange`, `inside / cell_volume == outside /
+/// voxel_volume`, so a cell holds its own volume's share of whatever the water
+/// around it holds and *no value of `membrane_scale` changes that number*. All
+/// a bigger membrane buys is arriving at the same equilibrium sooner.
+///
+/// That was learned the expensive way. Moving the ancestors onto a renewable
+/// diet, `membrane_scale` was swept over thirty-fold and `metabolic_rate` over
+/// twenty-fold, eight runs in all, with all sixteen cells shut down in every
+/// one of them. The four `metabolic_rate` runs came back *byte-identical* in
+/// every logged column; the four `membrane_scale` runs differ only in the
+/// fourth digit of the food column. Two dials that inert are not a tuning
+/// problem; they mean the quantity being tuned is not the one that binds. This
+/// function is that quantity, and it answers in a microsecond what those eight
+/// runs took half an hour to say:
+///
+/// ```text
+///   CH2O2S  (the larder diet)   5.590 x upkeep    lives
+///   HO2M    (the renewed diet)  0.059 x upkeep    starves
+/// ```
+///
+/// Ninety-five times short, on a diet that is ninety-five times better *per
+/// unit of pond*. The renewable living is real and the pond-wide figure from
+/// `hadean supply` is sound; what neither of them says is that a cell is a
+/// point consumer in a dilute field. Six hundred times less substrate in the
+/// water is six hundred times less inside the cell, and six and a half times
+/// more energy per turnover does not cover it.
+///
+/// # What it assumes
+///
+/// Equilibrium with the water, which is generous -- a cell that is eating has
+/// drawn its own voxel down below the pond's mean, and `supply` measures how
+/// fast the pond refills it. And a newborn's radius, which is mean: a cell
+/// swells towards division and the ratio grows with its volume. So this is an
+/// order-of-magnitude check like [`CellConfig::turnover_budget`], not a
+/// prediction, and its value is in the cases it rules out rather than the ones
+/// it passes.
+pub fn subsistence(
+    cfg: &CellConfig,
+    chem: &Chemistry,
+    reaction: ReactionId,
+    abundance: &[f64],
+    grid: &Grid,
+) -> f64 {
+    if cfg.maintenance_power <= 0.0 {
+        return f64::INFINITY;
+    }
+    let r = chem.reaction(reaction);
+    let share = cell_volume(cfg.birth_radius) / grid.voxel_volume() as f64;
+    let voxels = grid.len().max(1) as f64;
+    let inside = r
+        .reactants
+        .iter()
+        .map(|&(c, n)| {
+            let per_voxel = abundance.get(c as usize).copied().unwrap_or(0.0) / voxels;
+            per_voxel * share / n.max(1) as f64
+        })
+        .fold(f64::INFINITY, f64::min);
+    let turnovers = cfg.metabolic_rate as f64 * inside;
+    turnovers * -r.dh * cfg.capture_efficiency as f64 / cfg.maintenance_power
+}
+
+/// Find the reaction a config names in `cells.metabolism`, by its substrates.
+///
+/// `"HO2M + HM"` is the exergonic thermal reaction with exactly those two
+/// reactants. Coefficients may be written (`"2 HOM"`) and are matched.
+///
+/// This exists because the resupply rates that make [`choose_metabolism`]
+/// correct cost a probe to measure -- a settled lifeless world per candidate
+/// substrate, which is `hadean supply`, and which is far more than a run can
+/// afford at the moment its ancestors arrive. So the measurement is taken once
+/// with the instrument and its answer is written into the config, the same way
+/// `enzyme_sigma` is. A config that names a metabolism should name the command
+/// that found it in a comment beside it.
+pub fn named_metabolism(chem: &Chemistry, spec: &str) -> Result<ReactionId, String> {
+    let mut want: Vec<(u16, u8)> = Vec::new();
+    for term in spec.split('+') {
+        let term = term.trim();
+        if term.is_empty() {
+            return Err(format!("empty term in metabolism {spec:?}"));
+        }
+        // "2 HOM" and "HOM" both parse; the coefficient is optional.
+        let (n, name) = match term.split_once(char::is_whitespace) {
+            Some((head, rest)) if head.chars().all(|c| c.is_ascii_digit()) => (
+                head.parse::<u8>().map_err(|e| e.to_string())?,
+                rest.trim(),
+            ),
+            _ => (1u8, term),
+        };
+        let c = chem
+            .by_name(name)
+            .ok_or_else(|| format!("no compound named {name:?} in this chemistry"))?;
+        want.push((c, n));
+    }
+    want.sort_unstable();
+
+    let mut matches = chem.reactions.iter().filter(|r| {
+        let mut have: Vec<(u16, u8)> = r.reactants.clone();
+        have.sort_unstable();
+        have == want
+    });
+    let Some(r) = matches.next() else {
+        return Err(format!(
+            "no reaction in this chemistry has exactly the reactants {spec:?}"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!("{spec:?} names more than one reaction"));
+    }
+    if r.drive != Drive::Thermal {
+        return Err(format!(
+            "{spec:?} is not a thermal reaction, so a cell cannot make a living catalysing it"
+        ));
+    }
+    if r.dh >= 0.0 {
+        return Err(format!(
+            "{spec:?} is uphill by {:.3e} J; name the exergonic direction",
+            r.dh
+        ));
+    }
+    Ok(r.id)
 }
 
 /// What a cell's heritable state comes to, this tick, in the units the
@@ -2201,13 +2442,13 @@ mod tests {
         // zero.
         let (_, grid, chem, _, amounts, ..) = setup();
         let full = abundance(&chem, &amounts);
-        let chosen = choose_metabolism(&chem, &full, grid.len()).expect("a metabolism");
+        let chosen = choose_metabolism(&chem, &full, None, grid.len()).expect("a metabolism");
 
         // Take away one of its substrates and it must pick something else.
         let mut starved = full.clone();
         let missing = chem.reaction(chosen).reactants[0].0;
         starved[missing as usize] = 0.0;
-        let next = choose_metabolism(&chem, &starved, grid.len());
+        let next = choose_metabolism(&chem, &starved, None, grid.len());
         assert_ne!(next, Some(chosen), "kept a metabolism with no substrate");
         if let Some(next) = next {
             for &(c, _) in &chem.reaction(next).reactants {
@@ -2219,14 +2460,14 @@ mod tests {
         let mut trace = full.clone();
         trace[missing as usize] = 1.0;
         assert_ne!(
-            choose_metabolism(&chem, &trace, grid.len()),
+            choose_metabolism(&chem, &trace, None, grid.len()),
             Some(chosen),
             "a single particle counted as a larder"
         );
 
         // And an empty pond offers no living at all.
         assert_eq!(
-            choose_metabolism(&chem, &vec![0.0; chem.n_compounds()], grid.len()),
+            choose_metabolism(&chem, &vec![0.0; chem.n_compounds()], None, grid.len()),
             None
         );
     }
@@ -2238,7 +2479,7 @@ mod tests {
         // million. The cohort then starves surrounded by food it does not eat.
         let (_, grid, chem, _, amounts, ..) = setup();
         let mut pond = abundance(&chem, &amounts);
-        let chosen = choose_metabolism(&chem, &pond, grid.len()).expect("a metabolism");
+        let chosen = choose_metabolism(&chem, &pond, None, grid.len()).expect("a metabolism");
 
         // Leave the chosen reaction's substrates barely above the floor and
         // everything else as it was. It must lose its place.
@@ -2246,10 +2487,180 @@ mod tests {
         for &(c, _) in &chem.reaction(chosen).reactants {
             pond[c as usize] = floor * 1.5;
         }
-        let next = choose_metabolism(&chem, &pond, grid.len()).expect("a metabolism");
+        let next = choose_metabolism(&chem, &pond, None, grid.len()).expect("a metabolism");
         assert_ne!(
             next, chosen,
             "kept a metabolism whose larder had dropped by orders of magnitude"
+        );
+    }
+
+    #[test]
+    fn a_measured_rate_outranks_a_larder() {
+        // The correction `hadean supply` forced, as a unit test. On seed 1 the
+        // pond holds 1.15e13 particles of CH2O2S and rebuilds 1.03e7 a second
+        // of it; it holds 1.85e10 of HO2M and rebuilds 8.5e9 a second. Ranked
+        // by what is standing in the water the first wins by six hundred,
+        // which is the choice every run before this one was handed. Ranked by
+        // what the pond can actually resupply the order inverts, and only the
+        // second feeds a population for longer than it takes to eat it.
+        let (_, grid, chem, _, amounts, ..) = setup();
+        let pond = abundance(&chem, &amounts);
+        let floor = FOOD_FLOOR * grid.len() as f64;
+
+        let larder = choose_metabolism(&chem, &pond, None, grid.len()).expect("a metabolism");
+        let eaten: Vec<u16> = chem
+            .reaction(larder)
+            .reactants
+            .iter()
+            .map(|&(c, _)| c)
+            .collect();
+
+        // A second living, on entirely different substrates, so that setting
+        // one reaction's supply cannot move the other's.
+        let other = chem
+            .reactions
+            .iter()
+            .find(|r| {
+                r.id != larder
+                    && r.drive == Drive::Thermal
+                    && r.dh < 0.0
+                    && r
+                        .reactants
+                        .iter()
+                        .all(|&(c, _)| pond[c as usize] >= floor && !eaten.contains(&c))
+            })
+            .expect("a second living in this pond");
+
+        // The standing amounts do not move. Only the rates do.
+        let mut supply = vec![0.0; chem.n_compounds()];
+        for &c in &eaten {
+            supply[c as usize] = 1.0;
+        }
+        for &(c, _) in &other.reactants {
+            supply[c as usize] = 1.0e9;
+        }
+
+        let by_rate =
+            choose_metabolism(&chem, &pond, Some(&supply), grid.len()).expect("a metabolism");
+        assert_eq!(
+            by_rate, other.id,
+            "a trickle with a big stock behind it still outranked a torrent"
+        );
+    }
+
+    #[test]
+    fn a_resupplied_substrate_the_pond_does_not_hold_is_not_a_living() {
+        // A rate is the right ranking and it is not the whole rule. A cohort
+        // dropped into a pond holding none of its food starves before the
+        // first delivery arrives, however good the delivery rate is, so the
+        // presence floor survives the change.
+        let (_, grid, chem, _, amounts, ..) = setup();
+        let mut pond = abundance(&chem, &amounts);
+        let supply = vec![1.0e9; chem.n_compounds()];
+
+        let chosen =
+            choose_metabolism(&chem, &pond, Some(&supply), grid.len()).expect("a metabolism");
+        for &(c, _) in &chem.reaction(chosen).reactants {
+            pond[c as usize] = 0.0;
+        }
+        let next = choose_metabolism(&chem, &pond, Some(&supply), grid.len());
+        assert_ne!(
+            next,
+            Some(chosen),
+            "chose a metabolism whose substrates the pond holds none of"
+        );
+    }
+
+    #[test]
+    fn subsistence_scales_with_the_water_and_not_with_the_membrane() {
+        // The finding that cost eight runs, as three assertions.
+        let (cfg, grid, chem, _, amounts, ..) = setup();
+        let pond = abundance(&chem, &amounts);
+        let reaction =
+            choose_metabolism(&chem, &pond, None, grid.len()).expect("a metabolism");
+        let base = subsistence(&cfg, &chem, reaction, &pond, &grid);
+        assert!(base > 0.0 && base.is_finite());
+
+        // A passive membrane equilibrates; it does not concentrate. Thirty
+        // times more of it buys a cell nothing at all, which is exactly what
+        // thirty times more of it did in the pond.
+        let wider = CellConfig {
+            membrane_scale: cfg.membrane_scale * 30.0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            subsistence(&wider, &chem, reaction, &pond, &grid),
+            base,
+            "a bigger membrane changed what a cell can earn"
+        );
+
+        // What does move it: how dilute the food is, and how expensive the
+        // cell is. Both linearly.
+        let thin: Vec<f64> = pond.iter().map(|&x| x / 10.0).collect();
+        let diluted = subsistence(&cfg, &chem, reaction, &thin, &grid);
+        assert!(
+            (diluted * 10.0 - base).abs() <= base * 1.0e-9,
+            "ten times less food in the water did not cost ten times the living: \
+{diluted:e} against {base:e}"
+        );
+        let dearer = CellConfig {
+            maintenance_power: cfg.maintenance_power * 100.0,
+            ..cfg.clone()
+        };
+        let paid = subsistence(&dearer, &chem, reaction, &pond, &grid);
+        assert!((paid * 100.0 - base).abs() <= base * 1.0e-9);
+    }
+
+    #[test]
+    fn a_named_metabolism_is_read_by_its_substrates() {
+        let (_, grid, chem, _, amounts, ..) = setup();
+        let chosen = choose_metabolism(&chem, &abundance(&chem, &amounts), None, grid.len())
+            .expect("a metabolism");
+        let r = chem.reaction(chosen);
+
+        // Write the reaction out the way `hadean supply` prints it, with and
+        // without the coefficients, and read it back.
+        let spelled = |with_n: bool| {
+            r.reactants
+                .iter()
+                .map(|&(c, n)| {
+                    if with_n && n > 1 {
+                        format!("{n} {}", chem.compound(c).name)
+                    } else {
+                        chem.compound(c).name.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        assert_eq!(named_metabolism(&chem, &spelled(true)), Ok(chosen));
+        // Order is a spelling, not a fact about the reaction.
+        let mut reversed: Vec<&str> = Vec::new();
+        let text = spelled(true);
+        reversed.extend(text.split('+').map(str::trim));
+        reversed.reverse();
+        assert_eq!(named_metabolism(&chem, &reversed.join(" + ")), Ok(chosen));
+
+        assert!(named_metabolism(&chem, "NotAThing").is_err());
+        assert!(named_metabolism(&chem, "").is_err());
+        // The uphill direction of a real reaction is named by its products,
+        // and naming it has to fail rather than quietly hand a cell a living
+        // that costs energy to run.
+        let products = r
+            .products
+            .iter()
+            .map(|&(c, n)| {
+                if n > 1 {
+                    format!("{n} {}", chem.compound(c).name)
+                } else {
+                    chem.compound(c).name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        assert!(
+            named_metabolism(&chem, &products).is_err(),
+            "named the uphill direction and got a metabolism"
         );
     }
 

@@ -11,13 +11,17 @@ death, and conservative decomposition. Cell state participates in audits,
 hashes, snapshots, and CSV telemetry. Cells now carry a heritable trait and the
 pond selects on it, which is the first evolution here.
 
-**The live finding is in "The population is mining, not grazing".** The Phase 2
-gate is blocked upstream of the cell layer: on seed 1 the ancestor's food is
-made from a carbon pool with one way in and no way out, so there is nothing for
-a population to settle at. Read that section before tuning anything.
+**The live finding is in "What the pond can resupply, which is not what it
+holds".** "The population is mining, not grazing" is still the diagnosis and it
+is now measured rather than argued: `hadean supply` reads the pond's resupply
+*rate* instead of its standing stock, and on seed 1 the ancestor's food is
+rebuilt at 1.03e7 particles a second while a reaction nothing has ever eaten is
+rebuilt at 8.5e9. The gate was never blocked by the cell layer; it was blocked
+by a metabolism chosen off the wrong column. Read those two sections and "The
+living the pond makes and the cell cannot reach" before tuning anything.
 
 ```
-mise exec -- cargo test --release --workspace          # 199 tests
+mise exec -- cargo test --release --workspace          # 220 tests
 mise exec -- cargo run -p hadean-headless --release -- verify --ticks 2000
   determinism ......... ok
   snapshot replay ..... ok
@@ -1550,50 +1554,284 @@ genome. **Append only.**
 
 ---
 
+## The `division_reserve` sweep, and what it closed
+
+Item 0 asked for the sweep between the two ends that had already been run, on
+the grounds that one of them had stopped failing for the reason that used to
+mask everything else. It is done, five points on `evolve.toml`, everything but
+`division_reserve` identical:
+
+| `division_reserve` | peak | births | after the peak | food eaten | finish |
+| --- | --- | --- | --- | --- | --- |
+| 4e-10 | 2212 | 2215 | 3 | 15.8x | 2 |
+| 1e-9 | 979 | 979 | 0 | 16.9x | 4 |
+| 2e-9 | 590 | 590 | 0 | 24.5x | 5 |
+| 4e-9 | 330 | 330 | 0 | 9.6x | 2 |
+| 1e-8 | 157 | 161 | 0 | 15.1x | 7 |
+
+**`division_reserve` buys peak population and nothing else.** The peak scales
+almost exactly inversely with it -- the product is 0.9e-6 to 1.6e-6 across four
+and a half octaves -- and at every point `births` comes out equal to the peak
+to within four. That is one generation, five times over. Births after the peak
+are zero at four of the five points and three at the fifth, food is eaten down
+by ten to twenty-five fold at every point, and every run finishes within a
+handful of cells of extinction.
+
+So the dial is not the variable, and the two ends were not two different
+failures with a shared cause -- they were one failure seen at two
+magnifications. The sweep was worth running because it is the last thing that
+could have been true about the cell layer, and it is not true. Whatever is
+wrong is upstream of `CellConfig`, which is what item 1 has said all along.
+
+---
+
+## What the pond can resupply, which is not what it holds
+
+`choose_metabolism` had been wrong three times, each time by trusting something
+that looked like food, and the third correction -- rank by measured standing
+stock -- is the one every run in this project has been built on. It is also
+wrong, and the section above is what it costs.
+
+A standing stock is a larder. A living is a *rate*. Nothing here measured one.
+
+### The instrument
+
+`hadean supply` settles a lifeless pond, takes one compound out of it
+entirely, and then keeps taking every particle the chemistry makes of it, for
+as long as the probe runs. Held at zero, the network runs its production of
+that compound as fast as it can, so what has to be removed each second to keep
+it there is **the largest harvest the pond will ever support**. The standing
+stock is taken out first and deliberately not counted: that is the larder, and
+being fooled by the larder is the entire point.
+
+Three things make it honest rather than decorative.
+
+* **The removal is booked in the audit.** `World::harvest` records a negative
+  injection in the same ledger a vent uses, so a probe cannot quietly
+  manufacture the answer -- `a_probe_stays_inside_the_audit` runs one and
+  checks the energy and mass drift afterwards.
+* **Each probe is its own world**, restored from one shared settled snapshot,
+  so `--jobs` changes the wall clock and nothing else.
+* **It is cut into windows.** A pond that hands over as much in the last window
+  as the first is producing the compound; one whose rate has collapsed between
+  them was handing over a stock. That ratio is the `holding` column, and it is
+  what separates the two readings that had been conflated.
+
+### It agrees with the one rate that was never in doubt
+
+`gate.toml` has `vents = 3` and `fuel_rate = 4.0e9`, so a vent fuel is
+resupplied at exactly 1.2e10 particles per second and the config says so
+outright. Run blind over the whole chemistry, the probe measures HM at
+**1.206e10/s** and H2 at 1.214e10/s. That is the instrument calibrating itself
+against a number it was not told, and it is a test:
+`a_probe_recovers_the_flux_the_config_already_knows`.
+
+### What it found on seed 1
+
+```
+  compound       standing      opening    sustained  holding
+  HM              4.621e11   1.208e10/s   1.206e10/s    0.998  renewed
+  H2             1.333e13   1.215e10/s   1.214e10/s    0.999  renewed
+  HO2M            1.854e10    6.913e9/s    8.512e9/s    1.231  renewed
+  HO3M            1.306e12    8.465e9/s    6.867e9/s    0.811  renewed
+  CH2O2S          1.150e13   3.048e9/s    1.027e7/s    0.003  larder
+  H2O             1.152e15   1.988e6/s    2.031e4/s    0.010  larder
+  H3N             1.152e13   1.516e4/s    0.000e0/s    0.000  dead end
+```
+
+`CH2O2S` is the ancestor's food. It is the second-largest stock in the pond and
+the pond rebuilds **ten million particles a second** of it -- three orders
+below the compounds either side of it in that table, and a factor of three
+hundred below its own opening rate, because the opening rate is the last of the
+CO2 going through. The mining diagnosis was argued from the food column and a
+lifeless control; this measures it directly.
+
+And the pond has a renewable living in it that nothing has ever eaten:
+
+```
+    sustains   population  per newborn  reaction
+   4.554e-9 W      455 cells   HO2M + HM <=> 2 HOM
+  8.387e-13 W        0 cells   H2 + CH2O2S <=> H2O + CH2OS
+```
+
+The pond holds six hundred times more CH2O2S than HO2M and rebuilds eight
+hundred times less of it. **Ranked by amount the ancestor gets the first;
+ranked by rate it should have had the second, which is worth five thousand
+times the sustainable power.** That is the mechanism under "the population is
+mining, not grazing", and it is not a badly tuned cell -- it is a metabolism
+chosen off the wrong column.
+
+### What changed in the code
+
+* `choose_metabolism` takes `supply: Option<&[f64]>`. With it the ranking is a
+  **power in watts**, directly comparable against `maintenance_power`, so the
+  quotient is a carrying capacity in cells -- the number every run before this
+  one lacked. Without it the standing-amount rule is exactly as it was, because
+  it is the pre-genome control's arithmetic and has to stay bit-identical.
+* `cells.metabolism` names a measured living by its substrates,
+  `"HO2M + HM"`. Measuring resupply costs one settled lifeless world per
+  candidate substrate, which a run cannot afford at the moment its ancestors
+  arrive, so the measurement is taken once with the instrument and written into
+  the config -- exactly as `enzyme_sigma` was measured with `chem --keys` and
+  written into `evolve.toml`. It is checked at world construction, so a bad
+  name costs nothing rather than two and a half minutes of world time.
+* `configs/renew.toml` is `gate.toml` with that one line changed.
+
+---
+
+## The living the pond makes and the cell cannot reach
+
+`renew.toml` on the carried-over lifecycle numbers: sixteen ancestors, dormant
+on the tick they arrived, dead of starvation by t = 600. Item 2 has been
+predicting that since before there was a second food chain -- the numbers were
+measured against a reaction releasing 82 kJ/mol on a substrate standing at
+1.15e13, and this one releases about 537 kJ/mol on a substrate standing at
+1.85e10.
+
+So it was swept. `membrane_scale` over thirty-fold, 1e4 to 3e5. Then
+`metabolic_rate` over twenty-fold, 500 to 10000. Eight runs, all sixteen cells
+shut down in all eight, and:
+
+* the four `metabolic_rate` runs are **byte-identical** in every logged column,
+  a twenty-fold change in the dial making no difference of any size at all;
+* the four `membrane_scale` runs differ only in the *fourth* digit of the food
+  column -- 1.379e10, 1.378e10, 1.377e10, 1.376e10 at t = 600 -- and not at all
+  in anything about the cells. Thirty times the membrane moved the pond by a
+  tenth of a percent.
+
+Two dials that inert are not a tuning problem. They mean the quantity being
+tuned is not the one that binds, and the arithmetic says which one is:
+
+```
+  CH2O2S (the larder diet)  1.997e9/voxel -> 3.425e7 in a cell -> 5.590e-11 W  (5.590 x upkeep)
+  HO2M   (the renewed diet) 3.212e6/voxel -> 5.511e4 in a cell -> 5.899e-13 W  (0.059 x upkeep)
+```
+
+**A passive membrane equilibrates; it does not concentrate.** At the steady
+state of `exchange`, `inside / cell_volume == outside / voxel_volume`, so a
+cell holds its own volume's share of whatever the water around it holds and *no
+value of `membrane_scale` changes that number*. All a bigger membrane buys is
+arriving at the same equilibrium sooner, which is why thirty times more of it
+moved nothing. `metabolic_rate` then saturates against what the membrane
+delivers, which is why twenty times more of that moved nothing either.
+
+Six hundred times less substrate in the water is six hundred times less inside
+the cell, and six and a half times more energy per turnover does not cover it.
+Ninety-five times short, on a diet that is five thousand times better *per unit
+of pond*.
+
+That is a third distinct sense of "food" and the pond-wide rate does not imply
+it: **`supply` measures what the world produces, and a cell is a point consumer
+in a dilute field.** Both bounds are real and a living has to clear both.
+`hadean_cell::subsistence` is the second one -- what one newborn earns as a
+multiple of its upkeep -- and it now prints from `ecology` the moment the
+metabolism is settled, and as the `per newborn` column of `supply`. It answers
+in a microsecond what those eight runs took half an hour to say.
+
+Confirmed against the world rather than asserted: holding everything else, at
+`maintenance_power` 1e-11 all sixteen cells are dormant, at 1e-12 the pond is
+mixed and flickering between the two, and at 1e-13 and below nothing is dormant
+at all. The break-even sits just under 1e-12 W against a predicted 5.9e-13.
+
+### Re-tuning against the diet, which is what item 2 asked for
+
+Scaling the whole cell energy budget down by the two orders the measurement
+calls for -- `maintenance_power` 1e-11 -> 1e-13, `division_reserve` 1e-8 ->
+3e-11, against a `turnover_budget` of 6e-11 -- and the ancestors divide. Two
+runs of 250000 ticks, both on `renew.toml`'s pond, differing only in
+`division_reserve`:
+
+| | `renew.toml` (3e-11) | B (1e-10) | `evolve.toml`, best of five |
+| --- | --- | --- | --- |
+| peak | **17333** at tick 187000 | 10196 at tick 196600 | 2212 at tick 26000 |
+| births | 17756 | 10241 | 2215 |
+| **after the peak** | **193** | 8 | 3 |
+| deaths | 8903 | 5481 | 2213 |
+| finish | 8853 | 4760 | 2 |
+| food eaten | 14.9x | 8.5x | 15.8x |
+| energy drift | 7.6e-12 | 1.3e-11 | -3.6e-11 |
+
+**One hundred and ninety-three births after the peak.** Every run in this
+project's history has recorded zero there, except the one that recorded three.
+That column is what a population turning over looks like, and it is the leg of
+the Phase 2 gate that has been missing since the beginning.
+
+Four other things in that table are worth reading.
+
+* **The peak is seven times higher and arrives seven times later.** On the
+  larder the population sprints through the food and peaks at tick 26000; here
+  it grows into a supply and peaks at 187000. A renewable pond has a
+  fundamentally longer timescale, and the gate's 250000-tick run length was
+  calibrated against the other one.
+* **Neither run got to show a recovery, because both were still crashing when
+  the clock ran out.** The trough is reported at tick 250000 in both -- that is
+  the last tick, not a turning point. This is a run-length result and not an
+  ecological one, and it is the single most misreadable thing in this section.
+* **The food comes back.** Under the larder every night's rebuild reached a
+  tenth of the last one, four orders of magnitude down and never up. Here the
+  food column falls to 2.4e3 at tick 240000 and is at 5.2e6 ten thousand ticks
+  later. That is the difference between a stock and a supply, showing up in the
+  one column that had been flat about it for the whole project.
+* **The uptake trait moved.** Mean 5.8 with a spread of 2.2, against 0.139 and
+  0.029 on the larder. The population is under real selection pressure on a
+  resource it can exhaust locally, which is what was wanted from the trait in
+  the first place.
+
+`renewB` doubles as the control showing the pre-run checks read the right
+world: at `division_reserve` 1e-10 against the same 6e-11 budget, `ecology`
+says *before* the run that only the far tail can fund a daughter, and the
+population duly sits at exactly sixteen for four hundred seconds before it
+starts to move.
+
+**The gate is still not met.** What has changed is what it is now waiting on: a
+longer horizon, rather than a mechanism that does not exist. An 800000-tick run
+of `renew.toml` is the next thing, and it is running.
+
 ## What is left
 
 ### Immediately outstanding
 
-0. **Nothing in the genome layer can be measured until the pond has a steady
-   state.** Every mutation rate in the table is per-division, so a population
-   that stops dividing has switched the whole layer off -- and on seed 1 it
-   always stops. At `division_reserve = 1e-8` the plateau has no births in it;
-   at 4e-10 it overshoots and has no waking cells in it. Both give exactly one
-   generation, for the same underlying reason: births balancing deaths is what
-   a carrying capacity *is*, and this pond does not have one. This is item 1
-   wearing a different hat, and it is why item 1 is still item 1. See "It was
-   tried, and buying births does not buy generations".
-
-   **Half of that diagnosis has since been dealt with and half has not.** The
-   4e-10 end failed because dormancy was one rule for the whole pond, so the
-   plateau shut down as one unit and the wake bar was unreachable for all of it
-   at once; that is gone, and the L6 section has the measurement. The 1e-8 end
-   is untouched and is the live blocker: at the population's measured spread of
-   0.259 the turnover budget is 3.11e-9 J against a `division_reserve` of 1e-8,
-   so no cell at the margin can fund a daughter whatever it decides about
-   sleeping. The 4e-10 end now produces three births after the peak against a
-   previous zero, and a standing variation of 0.542 against 0.357 -- enough to
-   clear its own turnover budget -- so **the sweep between the two ends is now
-   the single most informative run available** and should be the next thing
-   done. It was already called for; what changed is that one end of it has
-   stopped failing for the reason that used to mask everything else.
+0. ~~The `division_reserve` sweep.~~ **Done, and it closed rather than
+   opened.** Five points from 4e-10 to 1e-8: the peak scales inversely with the
+   dial, `births` equals the peak at every one of them, and births after the
+   peak are zero at four of five. One generation, five times over. See "The
+   `division_reserve` sweep, and what it closed". Nothing in `CellConfig` was
+   ever going to fix this.
 1. **Give the population a renewable living.** Still the one that matters, and
-   still not in `CellConfig`. The genome makes a renewable living *reachable*
-   -- a lineage that evolves onto the waste-recycling reaction closes the
-   carbon loop, which no dial could ever have done -- but reachable is not
-   found, and on the evidence so far the population never got enough births to
-   look. See "The population is mining, not grazing": the ancestor's food on
-   seed 1 is made from a carbon pool with one way in and no way out, so there
-   is no carrying capacity to find. Two routes that do not depend on evolution
-   finding it, and they are complementary:
-   * Make `choose_metabolism` weigh a *rate* rather than a standing amount. The
-     vents' injection rate is exactly known from the config, and a perturbation
-     of the settled lifeless pond measures the rest. It has been wrong three
-     times now by trusting something that looked like food, and this is the
-     third correction, not a new idea.
-   * Raise `vents.fuel_species` past 2 so O2 and H2S reach the water, and run
-     the gate on a seed whose ancestor eats vent fuel — 2, 3 and 5 all do. That
-     is a chemosynthetic vent community, which is what the vents are for.
+   it has moved from a diagnosis to a measurement and then to a run.
+   * `hadean supply` is the instrument that was asked for -- a rate, not an
+     amount -- and it agrees with the vents' known flux to within 0.5%. On seed
+     1 the ancestor's food is resupplied at 1.03e7 particles/s against a
+     standing stock of 1.15e13, and `HO2M + HM <=> 2 HOM` is resupplied at
+     8.5e9/s and sustains 4.554e-9 W, or 455 cells. The pond had a renewable
+     living in it the whole time and `choose_metabolism` was ranking on the
+     column that hides it.
+   * `configs/renew.toml` eats it. On the carried-over lifecycle numbers the
+     cohort starves, because a pond-wide rate is not a per-cell one; on numbers
+     re-measured against the diet it booms to 17333 and records **193 births
+     after the peak**, where every previous run in this project recorded zero
+     or three. **The recovery has still not been shown**, and the reason is a
+     run length rather than a mechanism: the peak lands at tick 187000 against
+     the larder's 26000, and both 250000-tick runs were still crashing when the
+     clock stopped. An 800000-tick run is the next thing and it is the first
+     item to check.
+   * The second route in this item is untried and is now much more attractive:
+     raise `vents.fuel_species` past 2 so O2 and H2S reach the water. On seeds
+     2, 3 and 5 that makes the ancestor's whole diet vent-fed, and `supply` can
+     say by how much before a run is spent on it. Every previous attempt at
+     this was flown blind.
+1b. **`renew.toml` is not the finished preset and should not be treated as
+   one.** `membrane_scale` and `metabolic_rate` are set where the sweeps showed
+   them to be inert, which is a floor and not a measurement, and
+   `maintenance_power` and `division_reserve` were scaled by the two orders the
+   subsistence arithmetic called for rather than tuned. What justifies each is
+   in the file. `population_cap` is the thing to watch: `renewC` was heading
+   for five figures within two hundred seconds, and a run that touches the cap
+   proves nothing by construction.
+1c. **`supply` has been run on one config.** It costs a settled world per
+   candidate substrate and it should be run on `pond.toml` at full depth, on
+   the other seeds, and at `fuel_species` above 2, before any of those is tuned
+   by hand. It is cheap next to the runs it replaces.
 2. The lifecycle numbers were tuned against seed 1's food chain. If the food
    chain changes, `division_reserve`, `membrane_scale` and `maximum_age` all
    have to be re-measured against it. Do not carry them over on trust; the

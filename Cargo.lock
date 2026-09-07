@@ -234,6 +234,7 @@ dependencies = [
  "hadean-core",
  "hadean-fields",
  "hadean-sim",
+ "rayon",
 ]
 
 [[package]]

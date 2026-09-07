@@ -86,6 +86,15 @@ impl World {
         let rng = Counter::new(config.seed);
         seed_soup(&config, &grid, &chem, &rng, &mut amounts);
 
+        // Checked here rather than where it is used: `introduce` runs at
+        // t = seed_delay, and a config that names a compound this chemistry
+        // does not have should not cost two and a half minutes of world time
+        // before it says so.
+        if let Some(spec) = &config.cells.metabolism {
+            hadean_cell::named_metabolism(&chem, spec)
+                .map_err(|e| anyhow::anyhow!("cells.metabolism: {e}"))?;
+        }
+
         let solver = LightSolver::new(&chem, config.light);
         let light = LightField::new(&grid);
         let flow = convection_roll(&grid, &config.flow);
@@ -489,6 +498,47 @@ impl World {
             .map(|&(_, amount, n)| amount / n.max(1) as f64)
             .fold(f64::INFINITY, f64::min)
     }
+
+    /// Particles of every compound in the pond, indexed by compound id.
+    ///
+    /// The same vector `introduce` chooses a metabolism from, which is why it
+    /// is public: a pre-run check that wants to say what that choice will cost
+    /// has to read the pond the same way the choice does.
+    pub fn abundance(&self) -> Vec<f64> {
+        abundance_of(&self.chem, &self.amounts)
+    }
+
+    /// Take every particle of one compound out of the water, and say how many
+    /// that was.
+    ///
+    /// This is a measuring instrument, not a mechanism: nothing in a normal
+    /// run calls it. It exists because the question "what can this pond feed a
+    /// population" is a *rate*, and the only honest way to read a rate off a
+    /// world like this one is to take the compound away and watch what the
+    /// chemistry does about it. Held at zero, the network runs its production
+    /// of that compound as fast as it can, and what has to be removed each
+    /// second to keep it there is the largest harvest the pond will ever
+    /// support. See `hadean supply`.
+    ///
+    /// The removal crosses the world boundary, so it is booked in the same
+    /// ledger a vent injection is, with the sign the other way round -- the
+    /// audit stays exact through a probe and a failing one still means what it
+    /// meant. Rounding residuals are left alone: they are already conserved
+    /// and they are parts of a particle.
+    pub fn harvest(&mut self, compound: u16) -> f64 {
+        let c = compound as usize;
+        if c >= self.amounts.n_compounds {
+            return 0.0;
+        }
+        let plane = self.amounts.plane_mut(c);
+        let mut taken = 0.0;
+        for v in plane.iter_mut() {
+            taken += *v as f64;
+            *v = 0.0;
+        }
+        self.audit.record_injection(&self.chem, compound, -taken);
+        taken
+    }
 }
 
 /// Particles of every compound in the world.
@@ -610,6 +660,82 @@ mod tests {
         assert!(
             profile[0] > *profile.last().unwrap(),
             "no light gradient: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_stays_inside_the_audit() {
+        // `harvest` takes matter out of the world, which is exactly the kind
+        // of thing that quietly breaks a conservation gate. It is booked in
+        // the same ledger a vent injection is, with the sign the other way
+        // round, so a probe must leave the audit as flat as it found it -- and
+        // a failing audit during a measurement is a build failure like any
+        // other.
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let before = w.audit_now();
+        assert!(before.passes(1.0e-6), "drifting before the probe");
+
+        let compound = w.chem.vent_fuel[0];
+        let mut taken = 0.0;
+        for _ in 0..300 {
+            w.step();
+            taken += w.harvest(compound);
+        }
+        assert!(taken > 0.0, "held a vent fuel at zero and nothing came back");
+        assert!(
+            w.amounts.total_of(compound as usize) == 0.0,
+            "the probe left some behind"
+        );
+
+        let after = w.audit_now();
+        assert!(
+            after.passes(1.0e-6),
+            "the probe broke the audit: energy {:e}, mass {:e}",
+            after.relative,
+            after.mass_drift
+        );
+    }
+
+    #[test]
+    fn a_probe_recovers_the_flux_the_config_already_knows() {
+        // The calibration. A vent fuel's resupply is the one rate in this
+        // world that is not in doubt -- `vents` times `fuel_rate`, straight
+        // out of the config -- so a probe that measures anything else is
+        // measuring itself. Run blind over the whole chemistry on `gate.toml`
+        // this recovered 1.206e10/s against a known 1.2e10/s.
+        //
+        // The tolerance is wide on purpose: the chemistry makes and consumes
+        // the fuel too, and the point of the check is that the instrument is
+        // reading the right order of magnitude of the right quantity, not that
+        // the pond is inert.
+        let cfg = WorldConfig {
+            // Dark, so the photochemistry is not also making the fuel and
+            // the only source left is the one the config states.
+            light: hadean_fields::light::LightConfig {
+                irradiance: [0.0; hadean_chem::chemistry::N_BANDS],
+                ..Default::default()
+            },
+            ..small()
+        };
+        let expected = cfg.vents.fuel_rate as f64 * cfg.heat.vents.max(1) as f64;
+        let dt = cfg.dt;
+        let mut w = World::new(cfg).expect("builds");
+        w.run(200);
+
+        let compound = w.chem.vent_fuel[0];
+        w.harvest(compound);
+        let ticks = 2000;
+        let mut taken = 0.0;
+        for _ in 0..ticks {
+            w.step();
+            taken += w.harvest(compound);
+        }
+        let measured = taken / (ticks as f64 * dt);
+        let ratio = measured / expected;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "probe measured {measured:.3e}/s against a vent flux of {expected:.3e}/s"
         );
     }
 

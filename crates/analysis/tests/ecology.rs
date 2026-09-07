@@ -133,7 +133,7 @@ fn a_metabolism_is_only_chosen_when_the_pond_has_laid_a_table() {
             .map(|c| world.amounts.total_of(c))
             .collect();
         let Some(chosen) =
-            hadean_cell::choose_metabolism(&world.chem, &abundance, world.grid.len())
+            hadean_cell::choose_metabolism(&world.chem, &abundance, None, world.grid.len())
         else {
             barren.push(seed);
             continue;
@@ -272,13 +272,71 @@ fn the_evolve_preset_is_the_gate_pond_with_a_genome() {
             enzyme_sigma: gate.cells.enzyme_sigma,
             transport_sigma: gate.cells.transport_sigma,
             structural_benefit: gate.cells.structural_benefit,
-            ..evolve.cells
+            ..evolve.cells.clone()
         },
         gate.cells,
         "the two presets differ somewhere other than the genome"
     );
 
     World::new(evolve).expect("evolve preset builds");
+}
+
+#[test]
+fn the_renew_preset_is_the_gate_pond_on_a_living_it_can_resupply() {
+    // Same argument as the two parity tests above. `renew.toml` exists to
+    // isolate what changing the *diet* does, and it can only do that if the
+    // pond around it did not change too.
+    let gate = WorldConfig::from_toml(include_str!("../../../configs/gate.toml"))
+        .expect("gate preset parses");
+    let renew = WorldConfig::from_toml(include_str!("../../../configs/renew.toml"))
+        .expect("renew preset parses");
+    renew.validate().expect("renew preset is a runnable world");
+
+    assert_eq!(renew.seed, gate.seed);
+    assert_eq!(renew.dt, gate.dt);
+    assert_eq!(renew.grid, gate.grid, "same pond, not a smaller one");
+    assert_eq!(renew.chemistry, gate.chemistry);
+    assert_eq!(renew.light, gate.light, "the sun must be the same sun");
+    assert_eq!(renew.heat, gate.heat);
+    assert_eq!(renew.flow, gate.flow);
+    assert_eq!(renew.vents, gate.vents);
+    assert_eq!(renew.initial, gate.initial);
+    assert_eq!(renew.schedule, gate.schedule);
+
+    // Unlike `evolve.toml`, this preset's lifecycle numbers are deliberately
+    // *not* the gate's -- carrying them over was tried and the cohort starved,
+    // because they were measured against a substrate standing six hundred
+    // times higher. So the parity enforced here is the pond, and the four
+    // numbers that may differ are named one by one rather than waved through:
+    // a fifth drifting in unremarked is exactly what this test is for.
+    assert!(gate.cells.metabolism.is_none(), "the control names a diet");
+    let named = renew.cells.metabolism.clone().expect("renew names no diet");
+    assert_eq!(
+        hadean_cell::CellConfig {
+            metabolism: gate.cells.metabolism.clone(),
+            membrane_scale: gate.cells.membrane_scale,
+            metabolic_rate: gate.cells.metabolic_rate,
+            maintenance_power: gate.cells.maintenance_power,
+            division_reserve: gate.cells.division_reserve,
+            ..renew.cells.clone()
+        },
+        gate.cells,
+        "the two presets differ somewhere other than the diet and its energetics"
+    );
+
+    // The diet has to name a real living in this chemistry. Whether a newborn
+    // can *pay* for it is not a property of the config file -- it depends on
+    // what the pond has made by t = seed_delay, and HO2M is a compound the
+    // chemistry builds rather than one the soup is seeded with, so at tick 0
+    // there is none of it and the question has no answer yet. `ecology` prints
+    // that check at the moment it becomes answerable; the arithmetic behind it
+    // is tested in `hadean_cell`.
+    let world = World::new(renew).expect("renew preset builds");
+    let reaction = hadean_cell::named_metabolism(&world.chem, &named).expect("a named reaction");
+    assert!(
+        world.chem.reaction(reaction).dh < 0.0,
+        "the named diet is uphill"
+    );
 }
 
 /// The Phase 2 gate. Minutes, not seconds -- run it with
