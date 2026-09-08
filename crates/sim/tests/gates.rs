@@ -223,7 +223,7 @@ fn mutation_is_what_makes_a_population_stop_being_one_lineage() {
         }
         world.run(400).expect("audit");
         (
-            world.cells.trait_summary().distinct_genomes,
+            world.cells.trait_summary(&world.config.cells).distinct_genomes,
             world.cells.alive(),
         )
     };

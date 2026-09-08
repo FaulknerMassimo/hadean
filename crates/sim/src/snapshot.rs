@@ -27,7 +27,14 @@ use crate::config::WorldConfig;
 use crate::world::World;
 
 const MAGIC: &[u8; 8] = b"HADEANv1";
-const FORMAT: u32 = 6;
+/// Bumped whenever a snapshot written by an older build can no longer be read
+/// by this one -- which includes **adding a field to the config**, not only
+/// changing the byte layout here. The config is stored as its serialised text
+/// beside a digest of that text, and a new field changes the text, so an old
+/// snapshot would otherwise fail on "config does not match its own digest",
+/// which is true and tells the reader nothing about what to do. Version 7 adds
+/// `cells.mutator_range`.
+const FORMAT: u32 = 7;
 /// zstd level 3 is the usual sweet spot: most of the ratio, little of the cost.
 const COMPRESSION: i32 = 3;
 
@@ -120,7 +127,10 @@ pub fn load(bytes: &[u8]) -> anyhow::Result<World> {
     }
     let format = cursor.u32()?;
     if format != FORMAT {
-        anyhow::bail!("snapshot format {format}, this build reads {FORMAT}");
+        anyhow::bail!(
+            "snapshot format {format}, this build reads {FORMAT} -- \
+             it was written by a different build and has to be regenerated"
+        );
     }
 
     let config_text = std::str::from_utf8(cursor.bytes()?)?;

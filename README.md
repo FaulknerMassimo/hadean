@@ -18,7 +18,11 @@ cell's lifecycle.
   decide what a cell eats, transporters that decide what it can take up,
   structural protein that decides what it can endure, and regulators that
   decide how much of each it makes. Duplication, indels, inversion and
-  whole-genome duplication act on it at every division
+  whole-genome duplication act on it at every division — and a regulator can
+  lean on the cell's own polymerase, so **the mutation rate is itself
+  heritable** and a lineage can choose to change faster or slower than the
+  config says. Off by default, because every run so far was taken at a fixed
+  rate
 - L4 protocell: membrane transport, metabolism, maintenance, Brownian motion,
   division, dormancy, individual lifespans, death, decomposition
 - L6 decision layer: receptors that sense the water, the cell's own reserve,
@@ -35,13 +39,37 @@ cell's lifecycle.
   every particle the chemistry makes of it, so what comes back is the largest
   harvest the world will sustain; and, since a probe exports matter and only a
   vent brings any in, how much of that harvest the world's inflow could
-  actually pay for
+  actually pay for. Probe at several settle depths in one pass and it reports
+  how each rate moved between them, which is the reading that separates a
+  supply from a pond still on its way down
+- `hadean returns`: what a *population* could live on, which is a different
+  question and until now an unmeasured one. A probe exports matter; a cell does
+  not. This one holds the substrate at zero by eating it rather than by taking
+  it away, leaves the products in the water where a cell would leave them, and
+  measures the turnover the pond will keep paying for — against a control pond
+  with nothing driven in it, so a metabolism whose substrate comes back round
+  the reverse of its own reaction reads as the thermal cycle it is
 
 The current milestone is the Phase 2 population gate: a population that grows
 into its food supply, crashes, and recovers. The machinery to judge it is in
 place. **The gate is not met**, and the reason has moved five times — the first
 three were the cell, the fourth was what the cells were given to eat, and the
-fifth was the instrument that chose it.
+fifth was the instrument that chose it. The fifth is the interesting one,
+because it has happened three times in a row: an amount, then a rate read at
+one moment, then a rate whose matter could not have been paid for. Each
+correction was right and each left something for the next one to find, which is
+why most of the recent work here is instruments rather than tuning.
+
+**Those instruments have now found a living that survives all three of them.**
+`configs/vent5.toml` sets the vents to inject oxygen, and at a 2200-second
+settle `HO2M` comes back renewed at 1.192e10 particles a second with every one
+of them paid for by matter entering the world — against 4.543e4/s and *"stock —
+no O enters this pond"* on the config before it. Four separate livings come
+back fully vent-fed, each paying a newborn hundreds of times its upkeep, and
+the cliff below them is two and a half orders down, exactly where the carbon
+chemistry starts. What that does *not* yet establish is the magnitudes: five
+fuel species inject two and a half times the matter of two, which is a confound
+the config says so at the top of itself.
 
 It was thought to be a famine, and it was ageing: every cell died at exactly
 the same age, so the cohort that boomed together aged out together. Individual
@@ -189,7 +217,13 @@ mise exec -- cargo run -p hadean-headless --release -- ecology \
 mise exec -- cargo run -p hadean-headless --release -- supply \
   --config configs/gate.toml --probe 600
 mise exec -- cargo run -p hadean-headless --release -- supply \
-  --config configs/renew.toml --settle 2200 --probe 600
+  --config configs/renew.toml --settle 150,600,2200 --probe 600 \
+  --settle-cache runs/settle
+mise exec -- cargo run -p hadean-headless --release -- returns \
+  --config configs/vent5.toml --settle 150,600,2200 --probe 600 \
+  --settle-cache runs/settle
+mise exec -- cargo run -p hadean-headless --release -- returns \
+  --config configs/renew.toml --metabolism "HO2M + HM" --probe 3000
 mise exec -- cargo run -p hadean-headless --release -- chem --keys
 mise exec -- cargo test --release --workspace
 ```
@@ -220,7 +254,45 @@ bound is deliberately generous, crediting one compound with every atom the
 vents delivered, so a compound reading zero there is not being resupplied at
 all. Read `--settle` as part of the measurement rather than as setup: it
 defaults to `seed_delay`, which is the instant the ancestors choose a diet, and
-on `renew.toml` that instant is a transient.
+on `renew.toml` that instant is a transient. Give it a list — `--settle
+150,600,2200` — and the same pond is probed at each depth in one pass, with a
+sweep table saying which readings moved. That catches a transient without the
+element ledger at all, which makes the two checks independent rather than one
+restating the other. `--settle-cache DIR` keeps the settled worlds; the settle
+was 84% of a probe's wall clock, a deep settle passes through every shallower
+one, and both probe commands share the cache, so re-probing a config is free.
+
+`returns` is the other half of that question, and the half nothing here
+measured until now. `supply` asks how fast the pond replaces a compound
+*removed from the world*, and no organism ever asks that: a probe exports
+matter and a cell does not. A cell turns its substrate into products and leaves
+every atom in the pond, so what bounds a population is not whether the vents
+can deliver the atoms — they are already here — but whether the light and the
+chemistry can drive the products back round. Same perturbation, reached the
+other way: hold the substrate at zero by *eating* it, and put the products
+where a cell would. There is no vent-fed column in its output and there should
+not be, because nothing crosses the boundary for the element ledger to see.
+
+What replaces it is a **control pond**. If the water puts the substrate back
+through the reverse of the very reaction being driven, the loop runs on the
+heat the forward leg just deposited — a cell living in it would be a heat
+engine on an ambient bath, and the energy audit stays perfectly flat through
+that, because nothing is created. So each depth also runs one world with
+nothing driven in it, and a probe's net is how much further the pond's chemical
+energy fell than the control's. `gross` and `sustains` are printed side by
+side: far apart means the joules went round in a circle. A net reading inside
+the control's own drift prints `unresolved` rather than a number — "the probe
+could not tell" and "there is nothing there" are different findings, and
+collapsing them is how this project has gone wrong before.
+
+It is an upper bound and says so: the water is the only limit in it, where a
+real cell is also limited by its membrane and its enzymes, so a living that
+does not appear in that table is a living no cell of any design could make
+here.
+
+`--metabolism "HO2M + HM"` names one diet in exactly the spelling a config's
+`cells.metabolism` uses, so an answer carries from the instrument to the config
+without going through a reaction id that changes with the seed.
 
 `chem --keys` is the measurement behind the genome's recognition widths: it
 reports how far apart the chemistry's affinity keys actually are, and how many
@@ -235,7 +307,13 @@ the grid and the cell lifecycle numbers is identical, and a test enforces that.
 `configs/evolve.toml` is `gate.toml` with the genome on and nothing else
 changed, enforced by another. `configs/renew.toml` is `gate.toml` eating the
 living the pond can actually resupply, which is one line, and its lifecycle
-numbers re-measured against that diet, which is four more.
+numbers re-measured against that diet, which is four more — and the diet it
+argues for is now known to have been a stock, which its own header says at the
+top. `configs/vent5.toml` is that pond with the vents set to inject oxygen, so
+the compound in question is built from matter that enters the world; a fourth
+parity test enforces that nothing else moved with it, and its header is candid
+that injecting five fuel species rather than two also injects two and a half
+times the matter, which is a confound and not a control.
 
 ## The sun has to move
 

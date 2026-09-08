@@ -321,6 +321,28 @@ pub struct CellConfig {
     /// Zero reproduces the old behaviour: one ancestor, and whatever a single
     /// division's worth of mutation happened to do to each copy.
     pub founder_divergence: u32,
+    /// Octaves a cell's own genome may move its replication fidelity over.
+    ///
+    /// A `Regulator` that is also a replication factor leans on the
+    /// polymerase; see [`Genome::mutator_drive`], which returns how hard, on
+    /// `-1..1`. This is what an octave of that is worth. At `2.0` a lineage
+    /// can reach a quarter of the configured rates or four times them, and
+    /// **mutation rate is then something the pond selects on** rather than
+    /// something the config states -- rising when the environment moves and
+    /// falling in stasis, which is the whole reason the mechanism is worth
+    /// having.
+    ///
+    /// **Zero, the default, switches the mechanism off entirely** and every
+    /// cell replicates at exactly [`CellConfig::mutation`]. That is deliberate:
+    /// every run in this project before this existed was taken at a fixed
+    /// rate, and a mechanism that quietly retunes the most consequential dial
+    /// in the genome layer is not something to have on by default in the
+    /// config that reproduces them.
+    ///
+    /// It cannot manufacture mutation from none: the rates are *scaled*, and
+    /// zero scales to zero, so `MutationRates::none()` is still a clone line
+    /// however hard a genome leans on it.
+    pub mutator_range: f32,
 }
 
 /// Total standing protein a cell carrying the hand-written ancestor's genome
@@ -369,6 +391,7 @@ impl Default for CellConfig {
             swim_speed: 2.0e-5,
             motility_power: 2.0e-12,
             founder_divergence: 20,
+            mutator_range: 0.0,
         }
     }
 }
@@ -414,6 +437,9 @@ impl CellConfig {
             return Err("cell lifecycle rates and thresholds must be positive".into());
         }
         self.mutation.validate()?;
+        if self.mutator_range < 0.0 || !self.mutator_range.is_finite() {
+            return Err("cell mutator range must be a finite non-negative number of octaves".into());
+        }
         if self.enzyme_sigma <= 0.0 || self.transport_sigma <= 0.0 {
             return Err("genome recognition widths must be positive".into());
         }
@@ -720,6 +746,27 @@ impl Cell {
         cfg.starvation_time * (1.0 + (cfg.structural_benefit - 1.0) * structure.min(1.0))
     }
 
+    /// The multiplier this cell applies to the configured mutation rates when
+    /// it divides, for the run log.
+    ///
+    /// One means it replicates at exactly what the config states -- which is
+    /// every pre-genome cell, every genome with no replication factor in it,
+    /// and every cell in a world where
+    /// [`CellConfig::mutator_range`] is zero.
+    pub fn mutation_factor(&self, cfg: &CellConfig) -> f32 {
+        match &self.genome {
+            Some(g) if cfg.mutator_range > 0.0 => {
+                2.0f32.powf(cfg.mutator_range * g.mutator_drive(&self.proteome))
+            }
+            _ => 1.0,
+        }
+    }
+
+    /// Genes leaning on this cell's polymerase. Zero for a pre-genome cell.
+    pub fn mutator_genes(&self) -> usize {
+        self.genome.as_ref().map_or(0, |g| g.mutator_genes())
+    }
+
     /// Genes, for the run log. Zero for a pre-genome cell.
     pub fn gene_count(&self) -> usize {
         self.genome.as_ref().map_or(0, |g| g.genes.len())
@@ -928,7 +975,12 @@ impl Population {
     /// pushing; the spread says whether there is anything left for it to push
     /// on. A spread that collapses to nothing is the freeze coming back --
     /// the population has become clones again, by a different route.
-    pub fn trait_summary(&self) -> TraitSummary {
+    ///
+    /// `cfg` is read for one thing only: `mutator_range`, which turns a
+    /// genome's replication-factor drive into the multiplier on the mutation
+    /// rates it actually replicates at. A column the reader has to
+    /// exponentiate by hand is not a column.
+    pub fn trait_summary(&self, cfg: &CellConfig) -> TraitSummary {
         let mut n = 0.0;
         let mut sum = 0.0;
         let mut sum_sq = 0.0;
@@ -936,6 +988,7 @@ impl Population {
         let mut bytes = 0.0;
         let mut signal = 0.0;
         let mut quiescence = 0.0;
+        let mut mutation_factor = 0.0;
         // Distinct genomes, counted by content.
         //
         // Pointer identity would be cheaper and is what an `Arc` already
@@ -954,6 +1007,7 @@ impl Population {
             bytes += cell.genome_len() as f64;
             signal += cell.signal_genes() as f64;
             quiescence += cell.quiesce as f64;
+            mutation_factor += cell.mutation_factor(cfg) as f64;
             if let Some(g) = &cell.genome {
                 let mut h = StateHasher::new();
                 g.hash_state(&mut h);
@@ -974,6 +1028,7 @@ impl Population {
             mean_genome_bytes: bytes / n,
             distinct_genomes: lineages.len(),
             mean_signal_genes: signal / n,
+            mean_mutation_factor: mutation_factor / n,
             mean_quiescence: quiescence / n,
         }
     }
@@ -1220,6 +1275,18 @@ pub struct TraitSummary {
     pub distinct_genomes: usize,
     /// Mean receptors, neurons and effectors per living cell.
     pub mean_signal_genes: f64,
+    /// Mean replication fidelity the living population is choosing, as a
+    /// multiplier on the configured mutation rates.
+    ///
+    /// One means the population is replicating at exactly what the config
+    /// states -- either because no lineage carries a replication factor or
+    /// because [`CellConfig::mutator_range`] is zero and the mechanism is off.
+    /// Anything else is the pond having an opinion about how fast to change,
+    /// and `PLAN.md` predicts which way: up while the environment moves, down
+    /// in stasis. It is the only column here whose *baseline* is a number
+    /// other than zero, which is why it is a multiplier rather than a rate --
+    /// a rate would be six columns and they all move together.
+    pub mean_mutation_factor: f64,
     /// Mean quiescence depth across the living, 0..1.
     ///
     /// `dormant` counts cells past a reporting threshold and this is what the
@@ -1709,19 +1776,45 @@ impl CompoundTable {
 /// This function is the path for when something *did* fire.
 fn inherit_genome(
     parent: &Arc<Genome>,
+    proteome: &[f32],
     cfg: &CellConfig,
     chem: &Chemistry,
     rng: &Counter,
     tick: u64,
     id: u64,
 ) -> Arc<Genome> {
-    match genome::replicate(parent, &cfg.mutation, rng, tick, id) {
+    match genome::replicate(parent, &replication_rates(cfg, parent, proteome), rng, tick, id) {
         Some(mut child) => {
             child.bind(chem, cfg.enzyme_sigma, cfg.transport_sigma);
             Arc::new(child)
         }
         None => Arc::clone(parent),
     }
+}
+
+/// The rates a mother actually replicates at, which is hers and not the
+/// pond's.
+///
+/// [`CellConfig::mutation`] is what a cell replicates at with no opinion of
+/// its own. A genome carrying replication factors has one:
+/// [`Genome::mutator_drive`] says how hard it leans and in which direction,
+/// [`CellConfig::mutator_range`] says what an octave of that is worth, and the
+/// whole table moves together because fidelity is one property of one
+/// polymerase.
+///
+/// It is the **mother's** proteome, not the daughter's, because it is the
+/// mother's polymerase doing the copying. A daughter inherits the consequence
+/// of her mother's fidelity and gets to make her own choice at her own
+/// division, which is the loop that lets the rate evolve.
+fn replication_rates(cfg: &CellConfig, genome: &Genome, proteome: &[f32]) -> MutationRates {
+    if cfg.mutator_range <= 0.0 {
+        return cfg.mutation;
+    }
+    let drive = genome.mutator_drive(proteome);
+    if drive == 0.0 {
+        return cfg.mutation;
+    }
+    cfg.mutation.scaled(2.0f32.powf(cfg.mutator_range * drive))
 }
 
 /// The parts of the world a receptor can read that the cell layer does not
@@ -1806,7 +1899,12 @@ fn diverge_founder(
 ) -> Arc<Genome> {
     let mut genome = Arc::clone(ancestor);
     for round in 0..=cfg.founder_divergence as u64 {
-        genome = inherit_genome(&genome, cfg, chem, rng, round, id);
+        // No proteome: a founder is being made, not dividing, so there is no
+        // mother whose polymerase could have an opinion. The cohort therefore
+        // diverges at the configured rates whatever `mutator_range` is, which
+        // is the honest starting point -- a mutator allele is something the
+        // lineage has to be selected into, not something it is handed.
+        genome = inherit_genome(&genome, &[], cfg, chem, rng, round, id);
     }
     genome
 }
@@ -2210,7 +2308,15 @@ fn divide(
     let (child_genome, child_proteome, child_activation) = match &parent.genome {
         None => (None, Vec::new(), Vec::new()),
         Some(mine) => (
-            Some(inherit_genome(mine, cfg, chem, rng, tick, parent.id)),
+            Some(inherit_genome(
+                mine,
+                &parent.proteome,
+                cfg,
+                chem,
+                rng,
+                tick,
+                parent.id,
+            )),
             parent.proteome.clone(),
             // Her mother's frame of mind as well as her cytoplasm. A daughter
             // born in a famine should not open her eyes believing the pond is
@@ -3488,17 +3594,17 @@ mod tests {
         let (mut cfg, grid, chem, rng, amounts, ..) = setup();
         cfg.trait_spread = 0.0;
         let mut p = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
-        assert_eq!(p.trait_summary().mean_uptake, 1.0);
-        assert_eq!(p.trait_summary().uptake_spread, 0.0);
+        assert_eq!(p.trait_summary(&CellConfig::default()).mean_uptake, 1.0);
+        assert_eq!(p.trait_summary(&CellConfig::default()).uptake_spread, 0.0);
 
         p.cells[0].traits.uptake = 3.0;
-        assert_eq!(p.trait_summary().mean_uptake, 2.0);
-        assert_eq!(p.trait_summary().uptake_spread, 1.0);
+        assert_eq!(p.trait_summary(&CellConfig::default()).mean_uptake, 2.0);
+        assert_eq!(p.trait_summary(&CellConfig::default()).uptake_spread, 1.0);
 
         // A corpse has no traits to select on. Counting it would let a die-off
         // move the mean on its own and read as evolution.
         p.cells[0].state = CellState::Decomposing;
-        assert_eq!(p.trait_summary().mean_uptake, 1.0);
+        assert_eq!(p.trait_summary(&CellConfig::default()).mean_uptake, 1.0);
     }
 
     /// One genome cell in a small pond, its network run to steady state at a
@@ -3626,6 +3732,52 @@ mod tests {
         );
     }
 
+    /// The mechanism is off unless a config asks for it, and "off" has to mean
+    /// bit-identical rather than nearly. Every run in this project predates
+    /// mutator alleles and was taken at a fixed rate; a mechanism that quietly
+    /// retunes the most consequential dial in the genome layer must not be on
+    /// in the config that reproduces them.
+    #[test]
+    fn the_mutator_mechanism_is_off_unless_a_config_asks_for_it() {
+        let chem = hadean_chem::generate::generate(1, Default::default());
+        let reaction = chem
+            .reactions
+            .iter()
+            .find(|r| r.drive == Drive::Thermal && r.dh < 0.0)
+            .expect("a chemistry with something to eat")
+            .id;
+        let g = genome::ancestor(&chem, reaction, &Counter::new(1), 0);
+        let cfg = CellConfig::default();
+        assert_eq!(cfg.mutator_range, 0.0, "the default must leave it off");
+        // Even handed a proteome that would push the rate hard, the rates come
+        // back untouched while the range is zero.
+        let full = vec![1.0f32; g.genes.len()];
+        assert_eq!(replication_rates(&cfg, &g, &full), cfg.mutation);
+        assert_eq!(replication_rates(&cfg, &g, &[]), cfg.mutation);
+    }
+
+    /// And with the range turned up, a genome carrying no replication factor
+    /// still replicates at exactly the configured rates. Turning the mechanism
+    /// on must not change what an existing lineage does; it must only give a
+    /// new one somewhere to go.
+    #[test]
+    fn turning_the_range_up_does_nothing_to_a_genome_without_the_allele() {
+        let chem = hadean_chem::generate::generate(1, Default::default());
+        let reaction = chem
+            .reactions
+            .iter()
+            .find(|r| r.drive == Drive::Thermal && r.dh < 0.0)
+            .expect("a chemistry with something to eat")
+            .id;
+        let g = genome::ancestor(&chem, reaction, &Counter::new(1), 0);
+        let cfg = CellConfig {
+            mutator_range: 2.0,
+            ..CellConfig::default()
+        };
+        let full = vec![1.0f32; g.genes.len()];
+        assert_eq!(replication_rates(&cfg, &g, &full), cfg.mutation);
+    }
+
     #[test]
     fn founders_are_relatives_rather_than_copies() {
         // Sixteen founders one division from the ancestor are eight or nine
@@ -3642,7 +3794,7 @@ mod tests {
         cfg.founder_divergence = 0;
         let clones = Population::seed(&cfg, &chem, &grid, &rng, &abundance(&chem, &amounts));
 
-        let lines = |p: &Population| p.trait_summary().distinct_genomes;
+        let lines = |p: &Population| p.trait_summary(&CellConfig::default()).distinct_genomes;
         assert!(
             lines(&diverged) > lines(&clones),
             "divergence bought no lineages: {} against {}",

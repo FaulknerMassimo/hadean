@@ -203,6 +203,27 @@ founder_divergence = 20
 swim_speed = 2.0e-5
 motility_power = 2.0e-12
 
+#   mutator_range = 0.0      Octaves a lineage may move its own mutation rate
+#                            over. Zero, here, deliberately: every run this
+#                            config has produced was taken at the fixed rates
+#                            below, and turning the mechanism on would make the
+#                            most consequential dial in the genome layer a
+#                            different number in every cell -- which is the
+#                            point of it, and exactly why it does not belong in
+#                            the file the earlier runs are compared against.
+#
+#                            Set it to 2.0 in a copy to let the pond choose. A
+#                            `Regulator` whose second parameter is in the upper
+#                            half of its range is a replication factor as well
+#                            as a transcription factor, and its bias says how
+#                            hard and which way it leans on the polymerase. The
+#                            written ancestor carries none, so a mutator allele
+#                            is something mutation has to find and selection
+#                            has to keep. Watch `mean_mutation_factor` in the
+#                            CSV: one is the configured rate, and PLAN.md
+#                            predicts it rises while the pond is changing and
+#                            falls once it has settled.
+
 [cells.mutation]
 point = 1.0e-3
 indel = 1.0e-5

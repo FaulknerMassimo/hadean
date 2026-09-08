@@ -539,6 +539,123 @@ impl World {
         self.audit.record_injection(&self.chem, compound, -taken);
         taken
     }
+
+    /// Run one reaction forward as hard as the water will allow, leaving every
+    /// atom in the pond, and say how many turnovers that was.
+    ///
+    /// The mirror of [`World::harvest`], and the difference between them is
+    /// the whole question. `harvest` takes a compound *out* of the world, so
+    /// it measures what the pond can export -- which bounds a probe and bounds
+    /// nothing that lives here, because a cell exports nothing. A cell turns
+    /// substrates into products and leaves them in the water. What actually
+    /// bounds a population, then, is whether the chemistry and the light can
+    /// drive those products back round to the substrate, and holding the
+    /// substrate at zero *with the products returned* is the way to ask.
+    ///
+    /// It is an upper bound and not a simulation of a population: a real cell
+    /// is limited by its own membrane and its own enzymes as well as by the
+    /// water, and this is limited only by the water. That is the point. A
+    /// living no infinitely capable cell could make here is a living no cell
+    /// can make here.
+    ///
+    /// Matter is conserved exactly -- the same atoms leave the reactants and
+    /// arrive in the products, in the same voxel -- so nothing is booked in
+    /// the element ledger, unlike a harvest. The enthalpy released goes into
+    /// the water as heat, which is where it goes when the reaction runs on its
+    /// own; a cell would keep `capture_efficiency` of it instead, and that
+    /// difference belongs to the cell layer rather than to the supply.
+    ///
+    /// The heat is accumulated from the deltas [`ChemField::settle`] actually
+    /// applied, not from the intended extent, so a clamp or an `f32` rounding
+    /// is absorbed by the heat term and the audit stays flat. It is
+    /// deliberately *not* taken as a difference of the voxel's before and
+    /// after chemical totals, which is how the reaction step does it: that
+    /// works there because a step moves a visible fraction of the voxel, and
+    /// it fails here because the interesting reactions in this world limit on
+    /// a trace substrate. Differencing 1e-8 particles against the 1e12 sitting
+    /// beside them in the same sum gives zero in `f64`, and the joules would
+    /// be silently dropped rather than deposited.
+    pub fn turn_over(&mut self, reaction: u32) -> Turnover {
+        let Some(r) = self.chem.reactions.get(reaction as usize) else {
+            return Turnover::default();
+        };
+        // Cloned so the borrow of the chemistry ends before the fields move.
+        let reactants = r.reactants.clone();
+        let products = r.products.clone();
+        let h_f = |c: u16| self.chem.compound(c).h_f;
+        let enthalpy: Vec<f64> = reactants
+            .iter()
+            .chain(products.iter())
+            .map(|&(c, _)| h_f(c))
+            .collect();
+
+        let mut out = Turnover::default();
+        for voxel in 0..self.grid.len() {
+            // What this voxel's water can pay for. Amount plus residual,
+            // because the residual is material the field owns and cannot yet
+            // represent -- the same reason the reaction step carries it.
+            let mut extent = f64::INFINITY;
+            for &(c, n) in &reactants {
+                let have = self.amounts.get(c as usize, voxel) as f64
+                    + self.residual.get(c as usize, voxel) as f64;
+                extent = extent.min(have.max(0.0) / n as f64);
+            }
+            // Shrunk by a couple of ulps before anything is applied. `extent`
+            // is `have / n` minimised over the reactants, and `have / n * n`
+            // is not always `have` in `f64` -- for n = 3 it can land an ulp
+            // above, which would settle that amount to a small negative and
+            // leave a compound count below zero in the field.
+            //
+            // The shrink is done here rather than by clamping each reactant as
+            // it is consumed, and the difference matters: clamping a reactant
+            // while still adding the products at the full extent would create
+            // atoms. Mass balance in this project is structural, and a probe
+            // is not the place to start making it approximate.
+            extent *= 1.0 - 2.0 * f64::EPSILON;
+            // Both halves are load-bearing. A voxel with nothing in it gives
+            // zero and there is no work to do; a reaction with no reactants at
+            // all -- which the generator cannot produce, but this does not
+            // depend on that -- would leave `extent` at the infinity it starts
+            // from and consume nothing while creating products without end.
+            if !extent.is_finite() || extent <= 0.0 {
+                continue;
+            }
+            let mut chemical = 0.0;
+            for (i, &(c, n)) in reactants.iter().enumerate() {
+                let applied = self.amounts.settle(
+                    &mut self.residual,
+                    c as usize,
+                    voxel,
+                    -extent * n as f64,
+                );
+                chemical += applied * enthalpy[i];
+            }
+            for (i, &(c, n)) in products.iter().enumerate() {
+                let applied =
+                    self.amounts
+                        .settle(&mut self.residual, c as usize, voxel, extent * n as f64);
+                chemical += applied * enthalpy[reactants.len() + i];
+            }
+            if chemical != 0.0 {
+                self.heat.deposit(&self.grid, voxel, -chemical);
+            }
+            out.turnovers += extent;
+            out.released -= chemical;
+        }
+        out
+    }
+}
+
+/// What one sweep of [`World::turn_over`] took out of the water.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Turnover {
+    /// Extent, in reaction turnovers.
+    pub turnovers: f64,
+    /// Chemical energy the water gave up, J. Positive for an exergonic
+    /// reaction. Measured from the amounts that were actually moved rather
+    /// than from `turnovers * -dh`, so it is what the pond paid and not what
+    /// it was asked for.
+    pub released: Joules,
 }
 
 /// Particles of every compound in the world.
@@ -608,6 +725,7 @@ pub const LIGHT_BANDS: usize = N_BANDS;
 mod tests {
     use super::*;
     use crate::config::GridConfig;
+    use hadean_chem::chemistry::Reaction;
 
     fn small() -> WorldConfig {
         WorldConfig {
@@ -737,6 +855,262 @@ mod tests {
             (0.5..2.0).contains(&ratio),
             "probe measured {measured:.3e}/s against a vent flux of {expected:.3e}/s"
         );
+    }
+
+    /// The reaction the return-leg probe should be driven on: exergonic,
+    /// thermal, and the one this pond can pay for the most of.
+    ///
+    /// "Has some of every substrate" is not enough, and choosing that way is
+    /// how these tests first passed while measuring nothing. Ranked that way
+    /// the first hit here limits on a compound the pond holds 1.1e-8 particles
+    /// of; ranking on the limiting substrate instead does not help, because
+    /// *every* exergonic thermal reaction in this world limits on a trace. The
+    /// abundant compounds are not food -- which is the finding this project
+    /// has spent eight runs on, showing up in a unit test.
+    fn drivable(w: &World) -> u32 {
+        w.chem
+            .reactions
+            .iter()
+            .filter(|r| r.drive == hadean_chem::chemistry::Drive::Thermal && r.dh < 0.0)
+            .max_by(|a, b| {
+                let limit = |r: &Reaction| {
+                    r.reactants
+                        .iter()
+                        .map(|&(c, n)| w.amounts.total_of(c as usize) / n as f64)
+                        .fold(f64::INFINITY, f64::min)
+                };
+                limit(a)
+                    .partial_cmp(&limit(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|r| r.id)
+            .expect("no exergonic thermal reaction with substrates in the water")
+    }
+
+    /// Put enough of a reaction's substrates in every voxel that driving it
+    /// moves a measurable fraction of the water.
+    ///
+    /// This is a fixture, not a mechanism: it wrecks the audit baseline, so
+    /// only tests that do not read the audit may use it. It exists because
+    /// every exergonic reaction in this pond limits on a trace substrate, and
+    /// a test of where the joules went cannot be run on a turnover of 1e-8
+    /// particles -- there is nothing there to see.
+    fn stock_up(w: &mut World, reaction: u32, per_voxel: f32) {
+        let reactants = w.chem.reactions[reaction as usize].reactants.clone();
+        for &(c, _) in &reactants {
+            for voxel in 0..w.grid.len() {
+                w.amounts.set(c as usize, voxel, per_voxel);
+                w.residual.set(c as usize, voxel, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_return_leg_keeps_every_atom_in_the_pond() {
+        // The one thing that distinguishes this probe from `harvest` is that
+        // nothing leaves. A harvest is booked at the boundary; a turnover is
+        // not booked at all, because there is nothing to book -- so if it ever
+        // moved an atom across the boundary the mass audit would say so and
+        // nothing else would.
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let before = w.audit_now();
+        assert!(before.passes(1.0e-6), "drifting before the probe");
+        let ledger = w.audit.elements_in;
+
+        let reaction = drivable(&w);
+        let mut turnovers = 0.0;
+        for _ in 0..300 {
+            w.step();
+            turnovers += w.turn_over(reaction).turnovers;
+        }
+        assert!(turnovers > 0.0, "the pond never returned any substrate");
+
+        // Vents keep injecting during the probe, so the ledger moves; what
+        // must not happen is the probe moving it.
+        for e in 0..hadean_chem::element::N_ELEMENTS {
+            assert!(
+                w.audit.elements_in[e] >= ledger[e],
+                "element {e} left the world through a turnover"
+            );
+        }
+        let after = w.audit_now();
+        assert!(
+            after.passes(1.0e-6),
+            "the return leg broke the audit: energy {:e}, mass {:e}",
+            after.relative,
+            after.mass_drift
+        );
+    }
+
+    /// The enthalpy has to land somewhere. `dh` is negative, so driving the
+    /// reaction forward lowers the pond's chemical energy, and the only reason
+    /// the audit stays flat is that exactly those joules arrive in the water
+    /// as heat -- measured from the state either side, not from the intended
+    /// extent, so a clamp or an `f32` rounding is absorbed rather than lost.
+    ///
+    /// The comparison is made on the reaction's own participants rather than
+    /// on the audit's `chemical` total. That total is a sum over every
+    /// compound in every voxel, and one turnover of one reaction moves it by
+    /// far less than an ulp of it: the world-level reading cannot see this at
+    /// all, which is why the flat-audit test above is a check on conservation
+    /// and not on where the energy went.
+    #[test]
+    fn the_return_leg_pays_its_enthalpy_into_the_water() {
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let reaction = drivable(&w);
+        let participants: Vec<(usize, f64)> = {
+            let r = &w.chem.reactions[reaction as usize];
+            r.reactants
+                .iter()
+                .chain(r.products.iter())
+                .map(|&(c, _)| (c as usize, w.chem.compound(c).h_f))
+                .collect()
+        };
+        let chemical = |w: &World| -> f64 {
+            participants
+                .iter()
+                .map(|&(c, h)| (w.amounts.total_of(c) + w.residual.total_of(c)) * h)
+                .sum()
+        };
+
+        stock_up(&mut w, reaction, 1.0e10);
+        let chem_before = chemical(&w);
+        let thermal_before = w.audit_now().energy.thermal;
+        let out = w.turn_over(reaction);
+        assert!(out.turnovers > 0.0, "nothing to drive");
+        let released = chem_before - chemical(&w);
+        let warmed = w.audit_now().energy.thermal - thermal_before;
+
+        assert!(
+            released > 0.0,
+            "an exergonic turnover did not lower the participants' chemical energy"
+        );
+        // Three readings of the same joules, and they have to agree: what the
+        // participants lost, what `turn_over` says it took, and what the water
+        // gained. Any one of them alone would be self-reported.
+        assert!(
+            (out.released - released).abs() <= 1.0e-6 * released,
+            "turn_over reported {:e} J, the participants lost {released:e} J",
+            out.released
+        );
+        assert!(
+            (warmed - released).abs() <= 1.0e-6 * released,
+            "released {released:e} J of chemistry and the water gained {warmed:e} J"
+        );
+    }
+
+    /// A turnover must not leave a negative amount behind. `extent` is
+    /// `have / n` minimised over the reactants, and `have / n * n` is not
+    /// always `have` in `f64` -- for `n = 3` it can land an ulp above -- so
+    /// the extent is shrunk by a couple of ulps before anything is applied.
+    /// Driven hard for three hundred ticks, nothing anywhere in the field may
+    /// go below zero.
+    #[test]
+    fn a_turnover_never_leaves_a_negative_amount() {
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let reaction = drivable(&w);
+        for _ in 0..300 {
+            w.step();
+            w.turn_over(reaction);
+            assert!(
+                w.amounts.data.iter().all(|&x| x >= 0.0),
+                "a turnover drove a compound below zero"
+            );
+        }
+    }
+
+    /// And the shrink must be applied to the extent, not to the consumption.
+    /// Clamping a reactant as it is consumed while still adding the products
+    /// at the full extent would create atoms, quietly and below every
+    /// tolerance in the project. Driven at a coefficient of three, which is
+    /// where `have / n * n` overshoots, the element ledger must not move.
+    #[test]
+    fn a_turnover_creates_no_atoms_even_when_the_extent_rounds() {
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        // Every exergonic thermal reaction, so a coefficient above one is in
+        // the set whatever the seed generated.
+        let reactions: Vec<u32> = w
+            .chem
+            .reactions
+            .iter()
+            .filter(|r| r.drive == hadean_chem::chemistry::Drive::Thermal && r.dh < 0.0)
+            .map(|r| r.id)
+            .collect();
+        let before = w.audit_now();
+        assert!(before.passes(1.0e-6), "drifting before the probe");
+        for _ in 0..50 {
+            w.step();
+            for &r in &reactions {
+                w.turn_over(r);
+            }
+        }
+        let after = w.audit_now();
+        assert!(
+            after.mass_drift.abs() <= 1.0e-9,
+            "turnovers moved mass by {:e}",
+            after.mass_drift
+        );
+    }
+
+    /// A turnover consumes the reaction's scarcest substrate outright, the way
+    /// a harvest empties a compound, and that is what makes the reading a
+    /// ceiling rather than a guess about kinetics.
+    #[test]
+    fn a_turnover_empties_the_scarcest_substrate() {
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let reaction = drivable(&w);
+        let reactants = w.chem.reactions[reaction as usize].reactants.clone();
+        assert!(w.turn_over(reaction).turnovers > 0.0, "nothing to drive");
+        let left: f64 = reactants
+            .iter()
+            .map(|&(c, n)| w.amounts.total_of(c as usize) / n as f64)
+            .fold(f64::INFINITY, f64::min);
+        // Every voxel gave up as much as it could, so the scarcest substrate
+        // is gone from all of them; what is left is the rounding the residual
+        // carries, not a stock.
+        assert!(
+            left <= 1.0e-3 * w.grid.len() as f64,
+            "the scarcest substrate survived the turnover: {left:e} particles"
+        );
+    }
+
+    /// `returns` restores every probe from one shared snapshot and runs them
+    /// on separate threads, so a turnover has to be a pure function of the
+    /// state it is handed. If it were not, `--jobs` would change the answer
+    /// and the whole table would be a measurement of the scheduler.
+    #[test]
+    fn a_turnover_is_the_same_through_a_snapshot_and_a_copy() {
+        let mut w = World::new(small()).expect("builds");
+        w.run(200);
+        let reaction = drivable(&w);
+        let bytes = crate::snapshot::save(&w).expect("saves");
+
+        let run = |w: &mut World| -> Vec<(f64, f64)> {
+            (0..20)
+                .map(|_| {
+                    w.step();
+                    let out = w.turn_over(reaction);
+                    (out.turnovers, out.released)
+                })
+                .collect()
+        };
+
+        let mut a = crate::snapshot::load(&bytes).expect("loads");
+        let mut b = crate::snapshot::load(&bytes).expect("loads");
+        assert_eq!(run(&mut a), run(&mut b), "two copies disagreed");
+        // And bit-identical against the world it was saved from, which is the
+        // property `verify`'s replay gate asserts for `step` alone.
+        assert_eq!(
+            run(&mut crate::snapshot::load(&bytes).expect("loads")),
+            run(&mut w),
+            "the snapshot and its origin disagreed"
+        );
+        assert_eq!(a.state_digest(), b.state_digest());
     }
 
     #[test]

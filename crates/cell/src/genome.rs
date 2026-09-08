@@ -356,6 +356,51 @@ impl Genome {
         g
     }
 
+    /// How hard this genome's own proteins push its replication fidelity,
+    /// on `-1..1`.
+    ///
+    /// Negative is more faithful, positive is more error-prone. What an octave
+    /// of that is worth in actual rate is
+    /// [`CellConfig::mutator_range`](crate::CellConfig::mutator_range), which
+    /// is physiology; how far the cell pushes is genetic, and this is it.
+    ///
+    /// A `Regulator` whose `selector(2)` is 1 is a **replication factor** as
+    /// well as a transcription factor -- it still binds promoters, exactly as
+    /// before, and additionally leans on the polymerase. Additionally rather
+    /// than instead, because taking half the regulators out of the regulatory
+    /// network to pay for this would be a change to gene regulation dressed up
+    /// as a change to mutation. A transcription factor that also upregulates
+    /// an error-prone polymerase is what an SOS response is.
+    ///
+    /// The direction and the magnitude both come from [`Gene::bias`], and
+    /// nothing else, so there is one number in the genome to select on. The
+    /// sum is clamped rather than averaged: two mutator alleles pushing the
+    /// same way should push harder than one, up to the physiological limit.
+    ///
+    /// A genome with no replication factors returns zero and therefore
+    /// replicates at exactly the configured rates, which is what every run
+    /// before this mechanism existed did.
+    pub fn mutator_drive(&self, proteome: &[f32]) -> f32 {
+        let mut drive = 0.0;
+        for (i, gene) in self.genes.iter().enumerate() {
+            if gene.class != ProteinClass::Regulator || gene.selector(2) == 0 {
+                continue;
+            }
+            // `bias` spans -4..4 and a concentration spans 0..1, so one
+            // saturated allele at full expression covers the whole range.
+            drive += proteome.get(i).copied().unwrap_or(0.0) * gene.bias() * 0.25;
+        }
+        drive.clamp(-1.0, 1.0)
+    }
+
+    /// Genes that lean on the polymerase. For telemetry and for tests.
+    pub fn mutator_genes(&self) -> usize {
+        self.genes
+            .iter()
+            .filter(|g| g.class == ProteinClass::Regulator && g.selector(2) == 1)
+            .count()
+    }
+
     /// Work out what each protein acts on, and how strongly.
     ///
     /// Enzymes match reactions and transporters match compounds, both through
@@ -1034,6 +1079,29 @@ impl MutationRates {
         }
     }
 
+    /// Every operator scaled by one factor, clamped where `validate` would
+    /// have refused the result.
+    ///
+    /// This is how a mutator allele acts: it moves the whole table together
+    /// rather than one operator, because a cell's replication fidelity is one
+    /// property of one polymerase and not six independent dials. Zero stays
+    /// zero under any factor, so [`none`](Self::none) is still a clone line
+    /// however hard a genome leans on it -- which keeps the control a control.
+    pub fn scaled(&self, factor: f32) -> Self {
+        let f = factor.max(0.0);
+        // The same ceiling `validate` applies, so a genome cannot mutate its
+        // way to a rate the config layer would have rejected outright.
+        let per_byte = |r: f32| (r * f).min(0.5);
+        Self {
+            point: per_byte(self.point),
+            indel: per_byte(self.indel),
+            duplication: self.duplication * f,
+            deletion: self.deletion * f,
+            inversion: self.inversion * f,
+            genome_duplication: self.genome_duplication * f,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let all = [
             self.point,
@@ -1429,6 +1497,114 @@ mod tests {
                 chem.compounds[c as usize].name
             );
         }
+    }
+
+    /// One regulator gene written by hand, so a replication factor can be
+    /// asked for rather than hoped for. `params[1]` picks the role and
+    /// `params[2]` becomes the bias, which is both the direction and the size
+    /// of the push.
+    fn regulator(role: f32, bias: f32) -> Genome {
+        let mut params = [0.0f32; N_PARAMS];
+        params[1] = role;
+        params[2] = bias;
+        let mut bytes = Vec::new();
+        write_gene(
+            &mut bytes,
+            &[0.0; KEY_DIM],
+            0.9,
+            &[],
+            ProteinClass::Regulator,
+            &[0.5; KEY_DIM],
+            &params,
+            0.05,
+        );
+        Genome::new(bytes)
+    }
+
+    /// The ancestor carries no replication factor, so it replicates at exactly
+    /// the configured rates and a mutator allele is something the pond has to
+    /// select into a lineage rather than something it is handed. That is what
+    /// `PLAN.md` asks for, and it is a property of the written ancestor rather
+    /// than of the mechanism, so it is worth pinning.
+    #[test]
+    fn the_ancestor_carries_no_replication_factor() {
+        let chem = hadean_chem::generate::generate(1, Default::default());
+        let reaction = chem
+            .reactions
+            .iter()
+            .find(|r| r.drive == Drive::Thermal && r.dh < 0.0)
+            .expect("a chemistry with something to eat")
+            .id;
+        let g = ancestor(&chem, reaction, &rng(), 0);
+        assert_eq!(g.mutator_genes(), 0);
+        let full = vec![1.0f32; g.genes.len()];
+        assert_eq!(g.mutator_drive(&full), 0.0);
+    }
+
+    /// A regulator that is not a replication factor is invisible here however
+    /// hard its bias pushes, and one that is pushes in the direction of its
+    /// bias. Both directions, because a lineage in stasis wants the other one.
+    #[test]
+    fn a_replication_factor_pushes_in_the_direction_of_its_bias() {
+        // params[1] = 0.0 selects role 0: a transcription factor and nothing
+        // else, whatever its bias says.
+        let plain = regulator(0.0, 1.0);
+        assert_eq!(plain.mutator_genes(), 0);
+        assert_eq!(plain.mutator_drive(&[1.0]), 0.0);
+
+        // params[2] = 1.0 is a bias of +4, which at full expression is the
+        // whole range: maximally error-prone.
+        let sloppy = regulator(1.0, 1.0);
+        assert_eq!(sloppy.mutator_genes(), 1);
+        assert_eq!(sloppy.mutator_drive(&[1.0]), 1.0);
+        // Half expressed is half the push. This is the gradient selection
+        // climbs; a step function would give it nothing to climb.
+        assert!((sloppy.mutator_drive(&[0.5]) - 0.5).abs() < 1.0e-6);
+        // Not expressed at all is no push, which is what makes the allele
+        // something a cell can carry and not use.
+        assert_eq!(sloppy.mutator_drive(&[0.0]), 0.0);
+
+        // params[2] = 0.0 is a bias of -4: maximally faithful.
+        let careful = regulator(1.0, 0.0);
+        assert_eq!(careful.mutator_drive(&[1.0]), -1.0);
+    }
+
+    /// A clone line stays a clone line. The rates are *scaled*, and zero
+    /// scales to zero however hard a genome leans on it -- so the control
+    /// every claim about evolution in this project is measured against cannot
+    /// be broken by a mutation.
+    #[test]
+    fn no_mutator_allele_can_break_a_clone_line() {
+        let none = MutationRates::none();
+        assert!(!none.scaled(1.0e6).any());
+        assert!(!none.scaled(4.0).any());
+    }
+
+    /// And a mutator cannot reach a rate the config layer would have refused.
+    /// `validate` rejects a per-byte rate above 0.5 as an error rather than a
+    /// fast run, and a genome must not be able to get there by the back door.
+    #[test]
+    fn a_mutator_cannot_scale_past_what_validate_accepts() {
+        let hot = MutationRates {
+            point: 0.4,
+            indel: 0.3,
+            ..MutationRates::default()
+        };
+        let scaled = hot.scaled(1000.0);
+        assert_eq!(scaled.point, 0.5);
+        assert_eq!(scaled.indel, 0.5);
+        assert!(scaled.validate().is_ok());
+        // The gene-level operators are counts per gene, not probabilities per
+        // byte, so they are free to go up and `validate` does not cap them.
+        assert!(scaled.duplication > hot.duplication);
+    }
+
+    /// Scaling by one is the identity, which is what makes `mutator_range = 0`
+    /// bit-identical to every run taken before this mechanism existed.
+    #[test]
+    fn scaling_by_one_changes_nothing() {
+        let base = MutationRates::default();
+        assert_eq!(base.scaled(1.0), base);
     }
 
     #[test]

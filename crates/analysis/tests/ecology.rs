@@ -16,6 +16,7 @@
 
 use hadean_analysis::population::{population_curve, Thresholds};
 use hadean_analysis::Series;
+use hadean_chem::element::{C, N_ELEMENTS, O};
 use hadean_sim::config::{GridConfig, WorldConfig};
 use hadean_sim::World;
 
@@ -336,6 +337,79 @@ fn the_renew_preset_is_the_gate_pond_on_a_living_it_can_resupply() {
     assert!(
         world.chem.reaction(reaction).dh < 0.0,
         "the named diet is uphill"
+    );
+}
+
+#[test]
+fn the_vent5_preset_is_the_renew_pond_with_oxygen_coming_into_it() {
+    // `vent5.toml` exists to isolate what putting O2 in the water does, and it
+    // can only do that if the pond around it did not change too. Same argument
+    // as the three parity tests above, with one wrinkle worth stating: the
+    // change is *inside* `[vents]`, so this is the one preset whose parity
+    // cannot be asserted by comparing that whole block.
+    let renew = WorldConfig::from_toml(include_str!("../../../configs/renew.toml"))
+        .expect("renew preset parses");
+    let vent5 = WorldConfig::from_toml(include_str!("../../../configs/vent5.toml"))
+        .expect("vent5 preset parses");
+    vent5.validate().expect("vent5 preset is a runnable world");
+
+    assert_eq!(vent5.seed, renew.seed);
+    assert_eq!(vent5.dt, renew.dt);
+    assert_eq!(vent5.grid, renew.grid, "same pond, not a smaller one");
+    assert_eq!(vent5.chemistry, renew.chemistry);
+    assert_eq!(vent5.light, renew.light, "the sun must be the same sun");
+    assert_eq!(vent5.heat, renew.heat, "the same vents in the same places");
+    assert_eq!(vent5.flow, renew.flow);
+    assert_eq!(vent5.initial, renew.initial);
+    assert_eq!(vent5.schedule, renew.schedule);
+    assert_eq!(
+        vent5.cells, renew.cells,
+        "the lifecycle numbers are renew's, inherited on trust and to be re-measured"
+    );
+
+    // One field differs, and it is the one the file is named for.
+    assert_eq!(
+        hadean_sim::config::VentConfig {
+            fuel_species: renew.vents.fuel_species,
+            ..vent5.vents
+        },
+        renew.vents,
+        "vent5 differs from renew somewhere other than fuel_species"
+    );
+    assert!(
+        vent5.vents.fuel_species > renew.vents.fuel_species,
+        "vent5 must inject more species than renew, not fewer"
+    );
+
+    // The point of the file, asserted rather than assumed: at this
+    // `fuel_species` the vents actually deliver oxygen, and at renew's they do
+    // not. `rank_vent_fuel` is a function of the seed, so this is a claim
+    // about seed 1's chemistry and it should fail loudly if that generator
+    // changes rather than quietly measuring a different pond.
+    let world = World::new(vent5.clone()).expect("vent5 preset builds");
+    let injected = |n: usize| -> Vec<[u16; N_ELEMENTS]> {
+        world.chem.vent_fuel[..n.min(world.chem.vent_fuel.len())]
+            .iter()
+            .map(|&c| world.chem.compound(c).formula)
+            .collect()
+    };
+    let carries = |fuels: &[[u16; N_ELEMENTS]], e: u8| {
+        fuels.iter().any(|f| f[e as usize] > 0)
+    };
+    assert!(
+        carries(&injected(vent5.vents.fuel_species), O),
+        "vent5 brings no oxygen into the pond, which is the only reason it exists"
+    );
+    assert!(
+        !carries(&injected(renew.vents.fuel_species), O),
+        "renew already brought oxygen in, so vent5 changes nothing"
+    );
+    // And the fact that bounds every carbon living on this seed, whatever the
+    // vents are set to.
+    assert!(
+        !carries(&injected(world.chem.vent_fuel.len()), C),
+        "carbon enters this pond at some fuel_species after all -- \
+         the handoff says it never does, and one of the two is now wrong"
     );
 }
 

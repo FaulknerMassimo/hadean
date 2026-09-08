@@ -88,6 +88,15 @@ pub struct Row {
     /// monotonically the pond is telling you that deciding anything does not
     /// pay in it, which is a finding rather than a bug.
     pub mean_signal_genes: f64,
+    /// Mean multiplier the living population applies to the configured
+    /// mutation rates.
+    ///
+    /// The only column here whose baseline is one rather than zero. It is one
+    /// whenever the mechanism is off or no lineage carries a replication
+    /// factor, and anything else is the pond choosing how fast to change --
+    /// `PLAN.md` predicts up while the environment moves and down in stasis,
+    /// and this is the column that would show it.
+    pub mean_mutation_factor: f64,
 }
 
 impl Row {
@@ -96,13 +105,13 @@ drift_j,relative_drift,mass_drift,light_in_j,radiated_out_j,vent_heat_in_j,\
 mean_temperature_k,surface_temperature_k,floor_temperature_k,surface_light_w_m2,\
 population,dormant,decomposing,births,deaths,cellular_reserve_j,substrate_particles,\
 mean_uptake,uptake_spread,mean_genes,mean_genome_bytes,distinct_genomes,diet_breadth,\
-mean_quiescence,mean_signal_genes";
+mean_quiescence,mean_signal_genes,mean_mutation_factor";
 
     /// Take a reading from a world and its latest audit.
     pub fn sample(world: &World, report: &AuditReport) -> Self {
         let temperature = world.temperature_profile();
         let light = world.light_profile();
-        let traits = world.cells.trait_summary();
+        let traits = world.cells.trait_summary(&world.config.cells);
         Self {
             tick: report.tick,
             elapsed: world.elapsed(),
@@ -135,12 +144,13 @@ mean_quiescence,mean_signal_genes";
             diet_breadth: world.cells.diet().len() as u64,
             mean_quiescence: traits.mean_quiescence,
             mean_signal_genes: traits.mean_signal_genes,
+            mean_mutation_factor: traits.mean_mutation_factor,
         }
     }
 
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6},{:.3},{:.1},{},{},{:.4},{:.3}",
+            "{},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.6e},{:.6e},{:.9e},{:.9e},{:.9e},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{:.9e},{:.9e},{:.6},{:.6},{:.3},{:.1},{},{},{:.4},{:.3},{:.4}",
             self.tick,
             self.elapsed,
             self.chemical,
@@ -172,6 +182,7 @@ mean_quiescence,mean_signal_genes";
             self.diet_breadth,
             self.mean_quiescence,
             self.mean_signal_genes,
+            self.mean_mutation_factor,
         )
     }
 }

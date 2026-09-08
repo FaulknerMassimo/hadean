@@ -1,0 +1,175 @@
+# The same pond as `renew.toml`, with oxygen coming into it.
+#
+# One line differs from `renew.toml` and it is `vents.fuel_species`. That file
+# names `HO2M + HM` as the diet on a `holding` of 1.231, and `hadean supply`'s
+# element ledger later showed HO2M is built from an element that does not enter
+# that pond at any rate: `fuel_species = 2` injects HM and H2, so `elements_in`
+# only ever accumulates H and M, and every oxygen atom HO2M is made of came out
+# of a standing stock. The pond retires its own oxygen in 2200 s with nothing
+# living in it.
+#
+# `rank_vent_fuel` orders this seed's fuel by energy:
+#
+#     HM, H2, H2S, HO3M, O2, H2NM
+#
+# so O2 is fifth, and `fuel_species = 5` is the smallest setting that puts it
+# in the water. That makes both reactants of
+#
+#     82  O2 + HM <=> HO2M
+#
+# vent-fed, which is what would turn `HO2M + HM -> 2 HOM` from a larder into a
+# living paid for from outside the pond. H2S and HO3M come in with it, so
+# sulphur and more oxygen enter too; carbon does not enter at any
+# `fuel_species` on this seed, so no carbon-based living here is sustainable
+# however the vents are set.
+#
+# THIS IS NOT A SINGLE-VARIABLE CHANGE AND SHOULD NOT BE READ AS ONE.
+# `fuel_rate` is per species per vent -- `vent_matter` loops the species and
+# injects `fuel_rate * dt` of each -- so going from two species to five injects
+# two and a half times the matter, not the same matter differently distributed.
+# Measured against the ledger: `renew.toml` delivers H 3.600e10 and M 1.200e10
+# atoms a second, this file delivers H 7.200e10, O 6.000e10, S 1.200e10, M
+# 2.400e10. Every standing stock here will be larger than `renew.toml`'s for
+# that reason alone, so a bigger number in this pond is not by itself evidence
+# that the new elements did anything.
+#
+# The controlled version is `fuel_rate = 1.6e9`, which holds the total matter
+# inflow where `renew.toml` had it and changes only which elements it is made
+# of. That is the run to do if this one says the diet works, because "it works"
+# and "it works because oxygen now enters" are different claims and only the
+# second is the reason this file exists.
+#
+# THE DIET LINE BELOW HAS NOW BEEN MEASURED AND IT SURVIVES. It was inherited
+# from `renew.toml` on trust, and the sweep says it is the best living here --
+# which is luck rather than method, because it was chosen off a column now
+# known to be wrong. `hadean supply --settle 150,600,2200 --probe 600`, at the
+# deepest settle:
+#
+#     compound       standing      sustained       funded  holding
+#     HO2M           1.640e11     1.192e10/s   2.400e10/s    1.031  renewed
+#
+#       sustains   population  per newborn  vent-fed  reaction
+#     6.380e-9 W    63800 cells   404.420x      100%  HO2M + HM <=> 2 HOM
+#     4.116e-9 W    41156 cells  193597.702x    100%  H2 + HO3M <=> H2O + HO2M
+#     4.087e-9 W    40870 cells   837.053x      100%  H2 + HO2M <=> H2O + HOM
+#     3.993e-9 W    39933 cells   251.539x      100%  O2 + HM <=> HO2M
+#     1.814e-11 W     181 cells     0.088x        0%  O2 + CH2OS <=> CH2O3S
+#
+# On `renew.toml` at the same depth HO2M reads 4.543e4/s and `stock - no O
+# enters this pond`. Four livings here are fully vent-fed and all four pay a
+# newborn many times its upkeep; the cliff below them is two and a half orders
+# down and it is exactly where the carbon chemistry starts.
+#
+# The settle sweep is what makes that a measurement rather than another
+# transient: HO2M reads 1.450e10, 1.199e10, 1.192e10 at 150, 600 and 2200 s --
+# `1.22x`, steady. H2, HM and O2 read 1.200e10/s at every depth, which is
+# `vents = 3` times `fuel_rate = 4.0e9` exactly, three times over, and is the
+# instrument checking itself against the one rate this world never doubted.
+#
+# What is NOT established: the magnitudes. See the confound above -- 63800
+# cells is not 63800 cells at renew's matter budget. And `supply` bounds a
+# probe, which exports matter; `hadean returns` is the reading that bounds a
+# population. Re-measure with:
+#
+#     hadean supply  --config configs/vent5.toml --settle 150,600,2200 \
+#       --probe 600 --settle-cache runs/settle
+#     hadean returns --config configs/vent5.toml --settle 150,600,2200 \
+#       --probe 600 --settle-cache runs/settle
+#
+# and read three things together, because they fail in different directions.
+# `supply`'s `funded` column says which elements can pay for a harvest at all.
+# Its settle sweep says whether the rate was still falling when the shallow
+# probe read it. And `returns` asks the question neither of them asks -- a cell
+# exports no matter, so what bounds a population is whether the products come
+# back round, not whether the vents deliver the atoms. Read `returns`' `gross`
+# against its `sustains`: far apart means the substrate is coming back through
+# the reverse of the same reaction on the forward leg's own heat, which is a
+# thermal cycle and not a living. None of these existed when this pond's last
+# two diets were chosen, and both of those were wrong.
+#
+# The two commands share `--settle-cache`, so the second is nearly free.
+#
+# The lifecycle numbers are `renew.toml`'s and are inherited ON TRUST, which
+# HANDOFF.md item 2 has said not to do since before there was a food chain to
+# change. They were measured against a diet whose supply was a stock. They will
+# have to be re-measured against whatever this config settles on -- see item 2.
+
+name = "vent5"
+seed = 1
+dt = 0.01
+
+[grid]
+nx = 24
+ny = 24
+nz = 10
+dx = 2.5e-5
+
+[schedule]
+physics = 1
+chemistry = 1
+transport = 1
+neural = 1
+expression = 10
+growth = 20
+development = 50
+phylogeny = 500
+audit = 100
+
+[chemistry]
+n_compounds = 32
+n_reactions = 240
+max_skeleton = 4
+ea_min_zj = 6.0
+ea_max_zj = 160.0
+rate_min = 0.1
+rate_max = 10000.0
+addition_fraction = 0.3
+absorption_scale = 4000.0
+photo_yield = 0.35
+n_photo = 2
+
+[light]
+irradiance = [40.0, 70.0, 95.0, 110.0, 105.0, 85.0, 55.0, 30.0]
+medium_extinction = [220.0, 260.0, 300.0, 350.0, 420.0, 520.0, 650.0, 820.0]
+day_length = 600.0
+
+[heat]
+ambient = 293.15
+sky = 289.15
+surface_transfer = 60.0
+vent_power = 2.0e-9
+vents = 3
+
+[flow]
+speed = 2.0e-5
+rolls = 2
+
+[vents]
+fuel_rate = 4.0e9
+fuel_species = 5
+
+[initial]
+water = 2.0e11
+primordial = 2.0e9
+noise = 0.25
+
+[cells]
+enabled = true
+metabolism = "HO2M + HM"
+initial_count = 16
+population_cap = 60000
+birth_radius = 4.0e-6
+membrane_scale = 1.0e4
+metabolic_rate = 500.0
+capture_efficiency = 0.6
+maintenance_power = 1.0e-13
+division_reserve = 3.0e-11
+starvation_time = 300.0
+maximum_age = 2400.0
+lifespan_spread = 0.4
+trait_spread = 0.5
+trait_cost = 0.5
+dormancy_power_fraction = 0.05
+dormancy_exit = 60.0
+decomposition_rate = 0.8
+seed_delay = 150.0
